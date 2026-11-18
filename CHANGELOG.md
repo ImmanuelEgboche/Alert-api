@@ -4,6 +4,75 @@ All notable changes to this project are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The
 [To do](#to-do) section at the bottom tracks known gaps.
 
+## [Unreleased]
+
+Tier 2: safe to open to other users. Test suite: 121 → 181 passing.
+
+### Upgrade steps (existing deployments)
+
+1. **Nothing to run for the database.** Migrations now run on startup. A
+   v1.0.0 database is detected, stamped at the baseline and upgraded in place.
+2. **Existing users must rotate their webhook secret** to learn it:
+   `POST /api/v1/me/webhook-secret`. Until they do, their webhooks are signed
+   with a random secret they don't have.
+3. **Update webhook receivers** to verify with the user's `webhook_secret`
+   (not `SECRET_KEY`), against the raw body (see README).
+4. **Webhooks to private addresses now fail** with `Blocked: ...`. For local
+   testing against `localhost`, set `WEBHOOK_ALLOW_PRIVATE_URLS=true` (refused
+   in production).
+5. **Behind a reverse proxy**, set `FORWARDED_ALLOW_IPS` to the proxy's
+   address, or every request shares the proxy's per-IP registration limit.
+6. Remove `RATE_LIMIT_BURST` from `.env` (no longer used) and optionally set
+   `REGISTER_RATE_LIMIT_PER_HOUR` (default 5).
+
+### Security
+
+- **SSRF: webhooks could target internal services.** Alert create/update now
+  rejects private, loopback, link-local, metadata and other non-public
+  targets with `422`. At delivery, a custom network backend resolves the host,
+  refuses if any address is non-public, and connects to the vetted IP itself,
+  so DNS rebinding can't swap in an internal address. TLS still verifies the
+  real hostname. IPv6 forms that embed IPv4 (mapped, 6to4, Teredo, NAT64) are
+  unwrapped and checked. Redirects and environment proxies are disabled.
+  *Verified:* `http://169.254.169.254/` and `localtest.me` (→ 127.0.0.1) are
+  blocked; valid HTTPS still delivers; bad certificates are still rejected.
+- **Per-user webhook signing secrets.** Webhooks were signed with the server's
+  `SECRET_KEY`, so users couldn't verify them. Each user now has a `whsec_`
+  secret, returned at registration. Delivery reads it on every attempt, so
+  rotation applies to pending retries. Disabled users' webhooks aren't sent.
+- **Rate limiting.** `RATE_LIMIT_PER_MINUTE` is now enforced per user across
+  all authenticated endpoints, and `/register` is limited per IP. Counters
+  live in Redis (shared across instances); a Redis outage fails open.
+- **API key rotation:** `POST /api/v1/me/api-key`. The old key dies at once.
+
+### Fixed
+
+- **Documented webhook verification failed for low-priced coins.** It
+  re-serialised the JSON, turning `0.00001234` into `1.234e-05` and breaking
+  the HMAC. Docs now verify the raw body (Python and Node, both tested).
+
+### Added
+
+- `GET /api/v1/me`, `POST /api/v1/me/api-key`, `POST /api/v1/me/webhook-secret`.
+- **Alembic migrations** (`alembic/`), applied on startup under a Postgres
+  advisory lock; `make migrate` and `make migration m="..."`. A test fails if
+  the models and migrations differ.
+- **CI** (`.github/workflows/ci.yml`): ruff, the full test suite against
+  Postgres and Redis, and a Docker build, on every push and PR.
+- Settings: `REGISTER_RATE_LIMIT_PER_HOUR`, `WEBHOOK_ALLOW_PRIVATE_URLS`.
+
+### Changed
+
+- The schema is created by migrations, not `create_all`. setup.sh runs them
+  instead of generating a broken Alembic scaffold.
+- `SECRET_KEY` no longer signs webhooks (production still requires a strong one).
+- Docs no longer claim unmeasured performance (latency, throughput, uptime) or
+  features that don't exist (interval trees, circuit breakers, Kraken).
+
+### Removed
+
+- `RATE_LIMIT_BURST` (never used).
+
 ## [1.0.0] - 2026-11-18
 
 The alert pipeline (price feed → match → webhook) now works end to end. It was
@@ -208,23 +277,28 @@ the stale-feed watchdog.
 
 ### Tier 2: safe for other users
 
-- [ ] **SSRF: the server will POST to any URL a user supplies.** Webhook URLs
-      need validation (block private, loopback and link-local addresses,
-      checked at delivery time to defeat DNS rebinding). *Verified:* the server
-      attempted 4 POSTs to `169.254.169.254` (the cloud metadata service).
-- [ ] **Per-user webhook signing secrets.** Webhooks are signed with the
-      server's `SECRET_KEY`, which users can't have, so they can't verify
-      signatures. Sharing it would let users forge each other's webhooks.
-- [ ] **Rate limiting.** `RATE_LIMIT_*` settings exist but are not enforced, so
-      `/register` and alert creation can be spammed.
-- [ ] **API key rotation endpoint.** Keys can't be recovered by design.
-- [ ] **Alembic migrations** in place of `create_all` and hand-written SQL.
-- [ ] **Shipping:** its own git repo (it currently sits untracked inside a
-      parent repo), CI (`.github/workflows/` is empty), and HTTPS hosting.
-- [ ] **README accuracy:** remove or measure the "<50ms p99", "99.9% uptime"
-      and "100K+ alerts/day" claims; Kraken is listed but not implemented.
+Done except hosting (see [Unreleased]):
+
+- [x] SSRF protection for webhook URLs
+- [x] Per-user webhook signing secrets
+- [x] Rate limiting
+- [x] API key rotation endpoint
+- [x] Alembic migrations
+- [x] Own git repo and CI
+- [ ] **HTTPS hosting.** Not chosen yet. Options: a VPS with Caddy in front
+      of the production Compose stack, or a managed platform (Fly.io,
+      Railway). Set `FORWARDED_ALLOW_IPS` behind any proxy.
+- [x] README accuracy: unmeasured claims removed (benchmarks still to do;
+      see below)
 
 ### Later / nice to have
+
+- [ ] Benchmark matching latency (1K/10K/100K alerts), sustained trades/sec
+      and memory per alert, with a reproducible script.
+- [ ] Replay protection: sign a timestamp with each webhook so receivers can
+      reject old deliveries.
+- [ ] Encrypt webhook secrets at rest (a database leak currently exposes
+      them, allowing forged webhooks to users).
 
 - [ ] Durable webhook queue (e.g. a Redis sorted set). Pending retries are lost
       on restart.
