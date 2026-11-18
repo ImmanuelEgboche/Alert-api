@@ -82,3 +82,7 @@ def test_production_refuses_replay_feed():
         Settings(_env_file=None, environment="production", secret_key="x" * 40,
                  feed_source="replay", replay_file="r.jsonl.gz")
 
+
+def test_match_workers_must_leave_redis_connections_free():
+    with pytest.raises(ValueError, match="MATCH_WORKERS"):
+        Settings(_env_file=None, match_workers=50, redis_max_connections=50)

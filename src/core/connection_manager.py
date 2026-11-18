@@ -25,7 +25,17 @@ class ConnectionManager:
     """Manage WebSocket connections and route price updates to matcher.
 
     One connection per exchange, shared by every subscribed symbol.
-    Multiplexes multiple alerts onto single connections for efficiency.
+
+    Matching runs on a fixed pool of workers, each with a bounded queue, and
+    every symbol is always routed to the same worker:
+      - a symbol's trades are matched in the order they happened
+      - concurrency (and so Redis connections in use) is capped at the pool size
+      - when the queues are full the feed reader waits (backpressure) rather
+        than dropping trades. Live, that slows reads from the socket; replay
+        at max speed runs exactly as fast as matching can keep up.
+    (It used to start one task per trade: a burst of more than
+    REDIS_MAX_CONNECTIONS trades failed with "Too many connections" and those
+    prices were never matched. Found by replaying a recording at max speed.)
     """
 
     def __init__(
@@ -50,9 +60,10 @@ class ConnectionManager:
         }
         self.symbol_subscriptions: dict[str, set[str]] = defaultdict(set)
 
-        # Strong refs to in-flight match tasks: asyncio only keeps weak refs,
-        # so un-referenced tasks can be garbage-collected mid-execution.
-        self._pending_tasks: set[asyncio.Task[Any]] = set()
+        # Match worker pool (started lazily: needs a running event loop)
+        self._match_queues: list[asyncio.Queue[Tick]] = []
+        self._match_workers: list[asyncio.Task[Any]] = []
+        self._matching_now = 0
 
         # Background connect tasks (connect() retries forever, so it must never
         # be awaited inline by startup or a request handler).
@@ -144,8 +155,25 @@ class ConnectionManager:
 
     @property
     def pending_matches(self) -> int:
-        """Trades being matched right now."""
-        return len(self._pending_tasks)
+        """Trades queued or being matched right now."""
+        return sum(q.qsize() for q in self._match_queues) + self._matching_now
+
+    def _start_match_workers(self) -> None:
+        n = settings.match_workers
+        self._match_queues = [asyncio.Queue(maxsize=settings.match_queue_size) for _ in range(n)]
+        self._match_workers = [
+            asyncio.create_task(self._match_worker(q)) for q in self._match_queues
+        ]
+
+    async def _match_worker(self, queue: "asyncio.Queue[Tick]") -> None:
+        while True:
+            tick = await queue.get()
+            self._matching_now += 1
+            try:
+                await self._match_with_own_session(tick)
+            finally:
+                self._matching_now -= 1
+                queue.task_done()
 
     async def _connect_in_background(self, exchange: str, connection: ExchangeConnection) -> None:
         """Connect, logging rather than raising (nobody awaits this task)."""
@@ -157,8 +185,12 @@ class ConnectionManager:
         except Exception as e:
             logger.error("exchange_connect_failed", exchange=exchange, error=str(e))
 
-    def _on_price_update(self, tick: Tick, exchange: str = "binance") -> None:
-        """Callback for each trade from an exchange (live or replayed)."""
+    async def _on_price_update(self, tick: Tick, exchange: str = "binance") -> None:
+        """Callback for each trade from an exchange (live or replayed).
+
+        Awaited by the feed: returns once the trade is queued for matching,
+        which waits if that symbol's worker is full (backpressure).
+        """
         if tick.exchange_ms is not None and tick.recv_ns:
             self.latency.record("exchange_to_receive", tick.recv_ns - tick.exchange_ms * 1_000_000)
 
@@ -172,9 +204,11 @@ class ConnectionManager:
                 logger.warning("trade_sequence_anomaly", exchange=exchange,
                                symbol=tick.symbol, kind=kind, trade_id=tick.trade_id)
 
-        task = asyncio.create_task(self._match_with_own_session(tick))
-        self._pending_tasks.add(task)
-        task.add_done_callback(self._pending_tasks.discard)
+        if not self._match_workers:
+            self._start_match_workers()
+        # Same symbol -> same worker -> matched in order
+        queue = self._match_queues[hash(tick.symbol) % len(self._match_queues)]
+        await queue.put(tick)
 
     async def _match_with_own_session(self, tick: Tick) -> None:
         """Run matching for one price update in its own DB session.
@@ -205,6 +239,12 @@ class ConnectionManager:
         for exchange, conns in self.connections.items():
             for conn in conns.values():
                 await conn.disconnect()
+
+        for task in self._match_workers:
+            task.cancel()
+        await asyncio.gather(*self._match_workers, return_exceptions=True)
+        self._match_workers.clear()
+        self._match_queues.clear()
         logger.info("disconnected_all_exchanges")
 
     async def get_active_connections(self) -> dict[str, int]:

@@ -185,7 +185,65 @@ async def test_live_and_replay_share_one_dispatch_path(tmp_path):
     assert [(t.trade_id, t.price) for t in ticks] == [(42, 123.0)]
 
 
+# --- matching pipeline: ordered, bounded, no drops -------------------------------
 
+class SlowMatcher:
+    """Records call order and peak concurrency."""
+
+    def __init__(self, delay: float = 0.001) -> None:
+        self.delay = delay
+        self.calls: list[tuple[str, int]] = []
+        self.active = 0
+        self.peak = 0
+
+    async def match_price_update(self, symbol, price, ts, session, tick=None):
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+        await asyncio.sleep(self.delay)
+        self.calls.append((symbol, tick.trade_id))
+        self.active -= 1
+
+
+@pytest.fixture
+def no_db(monkeypatch):
+    """Sessions are opened per match; nothing here touches the DB."""
+    class _S:
+        async def __aenter__(self):
+            return MagicMock()
+
+        async def __aexit__(self, *a):
+            return False
+
+    monkeypatch.setattr(cm_mod, "AsyncSessionLocal", lambda: _S())
+
+
+async def test_burst_is_bounded_ordered_and_lossless(tmp_path, monkeypatch, no_db):
+    """Regression: one task per trade let a burst exceed the Redis pool
+    ("Too many connections") and those trades were never matched."""
+    monkeypatch.setattr(cm_mod.settings, "match_workers", 4)
+    monkeypatch.setattr(cm_mod.settings, "match_queue_size", 5)
+    syms = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+    trades = [(syms[i % 3], i // 3 + 1, 1.0) for i in range(300)]
+    path = write_recording(tmp_path / "burst.jsonl.gz", trades, gap_ms=0)
+
+    matcher = SlowMatcher()
+    manager = ConnectionManager(matcher)
+    feed = ReplayConnection(path, speed=0)
+    manager.attach_feed(feed)
+    await feed.connect()
+    await asyncio.wait_for(feed.finished.wait(), 10)
+    deadline = time.monotonic() + 5
+    while manager.pending_matches and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    await manager.disconnect_all()
+
+    assert len(matcher.calls) == 300                       # nothing dropped
+    assert matcher.peak <= 4                               # never above the pool size
+    for s in syms:                                         # each symbol in trade order
+        ids = [tid for sym, tid in matcher.calls if sym == s]
+        assert ids == sorted(ids) and len(ids) == 100
+    assert manager.sequence.report()["total"]["missing"] == 0
+    assert manager.latency.summary()["match"]["count"] >= 300
 
 
 async def test_replay_feed_is_used_when_configured(tmp_path, monkeypatch):

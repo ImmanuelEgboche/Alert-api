@@ -32,8 +32,10 @@ AsyncSessionLocal = async_sessionmaker(
     autoflush=False,
 )
 
-# Redis connection pool
-redis_pool: aioredis.ConnectionPool | None = None
+# Redis connection pool. Blocking: when every connection is busy a caller
+# waits (up to the timeout) instead of failing with "Too many connections".
+redis_pool: aioredis.BlockingConnectionPool | None = None
+REDIS_POOL_TIMEOUT_SECONDS = 5
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
@@ -53,9 +55,10 @@ async def get_redis() -> aioredis.Redis:
     """Get Redis connection."""
     global redis_pool
     if redis_pool is None:
-        redis_pool = aioredis.ConnectionPool.from_url(
+        redis_pool = aioredis.BlockingConnectionPool.from_url(
             settings.redis_url_str,
             max_connections=settings.redis_max_connections,
+            timeout=REDIS_POOL_TIMEOUT_SECONDS,
             decode_responses=True,
         )
     return aioredis.Redis(connection_pool=redis_pool)

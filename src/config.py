@@ -80,6 +80,19 @@ class Settings(BaseSettings):
     redis_url: RedisDsn = Field(default="redis://localhost:6379/0")
     redis_max_connections: int = 50
 
+    # Matching: trades are processed by this many workers, each symbol always
+    # on the same worker (so its trades are matched in order). Each worker uses
+    # at most one Redis connection at a time, so keep it below
+    # REDIS_MAX_CONNECTIONS to leave room for API requests.
+    match_workers: int = Field(default=8, ge=1)
+    # Trades waiting per worker before the feed reader is made to wait
+    match_queue_size: int = Field(default=1000, ge=1)
+
+    @model_validator(mode="after")
+    def _match_workers_fit_redis_pool(self) -> "Settings":
+        if self.match_workers >= self.redis_max_connections:
+            raise ValueError("MATCH_WORKERS must be less than REDIS_MAX_CONNECTIONS")
+        return self
 
     # Security
     # Server-side secret. Webhooks are signed with each user's own
