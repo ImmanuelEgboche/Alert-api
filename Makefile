@@ -1,4 +1,4 @@
-.PHONY: help setup dev test clean docker-build docker-up docker-down format lint
+.PHONY: help setup dev migrate migration test clean docker-build docker-up docker-down format lint
 
 # Use the project venv when it exists, so make works without activating it first
 BIN := $(if $(wildcard venv/bin/python),venv/bin/,)
@@ -8,6 +8,8 @@ help:
 	@echo "======================================"
 	@echo "  make setup        - Initial project setup"
 	@echo "  make dev          - Start development server"
+	@echo "  make migrate      - Apply database migrations"
+	@echo "  make migration m=\"add x\" - Generate a migration from model changes"
 	@echo "  make test         - Run tests"
 	@echo "  make test-cov     - Run tests with coverage"
 	@echo "  make lint         - Run linters"
@@ -24,6 +26,13 @@ setup:
 dev:
 	@echo "Starting development server..."
 	@$(BIN)uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
+
+migrate:
+	@$(BIN)python -m src.migrate
+
+migration:
+	@test -n "$(m)" || (echo 'Usage: make migration m="describe the change"' && exit 1)
+	@$(BIN)alembic revision --autogenerate -m "$(m)"
 
 test:
 	@echo "Running tests..."

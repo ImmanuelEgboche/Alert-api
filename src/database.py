@@ -1,6 +1,5 @@
 """Database connection and session management."""
 from collections.abc import AsyncGenerator
-from typing import Any
 
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -11,7 +10,6 @@ from sqlalchemy.pool import NullPool
 import redis.asyncio as aioredis
 
 from src.config import get_settings
-from src.models import Base
 
 settings = get_settings()
 
@@ -61,12 +59,6 @@ async def get_redis() -> aioredis.Redis:
             decode_responses=True,
         )
     return aioredis.Redis(connection_pool=redis_pool)
-
-
-async def init_db() -> None:
-    """Initialize database tables."""
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
 
 
 async def close_db() -> None:

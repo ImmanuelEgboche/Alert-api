@@ -10,7 +10,8 @@ from fastapi.middleware.cors import CORSMiddleware
 import structlog
 
 from src.config import get_settings
-from src.database import init_db, close_db, AsyncSessionLocal
+from src.database import close_db, AsyncSessionLocal
+from src.migrate import upgrade_async as run_migrations
 from src.api.routes import router
 from src.api import dependencies as deps
 from src.core.matcher import AlertMatcher
@@ -54,9 +55,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     logger.info("starting_application", version=settings.app_version)
 
-    # Initialize database
-    await init_db()
-    logger.info("database_initialized")
+    # Bring the schema up to date (advisory-locked, so replicas take turns)
+    await run_migrations()
 
     # Initialize alert matcher
     alert_matcher = AlertMatcher()
