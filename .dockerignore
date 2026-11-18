@@ -1,0 +1,24 @@
+# Secrets: provided at runtime via docker-compose env_file, never baked into the image
+.env
+.env.*
+!.env.example
+
+# Local environments and tooling
+venv/
+.venv/
+env/
+.git/
+.github/
+.vscode/
+.idea/
+.DS_Store
+
+# Caches and build/test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+logs/

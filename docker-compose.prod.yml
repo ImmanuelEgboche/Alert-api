@@ -1,0 +1,112 @@
+# Production stack. Run with:
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Differences from docker-compose.yml (development):
+#   - The code is baked into the image: no source mount, no --reload.
+#   - ENVIRONMENT=production and DEBUG=false are forced here. The app refuses
+#     to start with a placeholder SECRET_KEY (see src/config.py).
+#   - Postgres and Redis are not published to the host at all; only the API is.
+#   - Postgres and Grafana passwords must be set in .env (no defaults).
+#   - Services restart on failure, and the API waits for healthy dependencies.
+#   - Image versions are pinned.
+#
+# Separate project name: its containers and volumes never collide with the
+# dev stack's.
+name: crypto-alert-prod
+
+services:
+  api:
+    build: .
+    env_file: .env
+    environment:
+      - ENVIRONMENT=production
+      - DEBUG=false
+      - DATABASE_URL=postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/cryptoalert
+      - REDIS_URL=redis://redis:6379/0
+    # One process only: each process would open its own exchange feeds and
+    # webhook queue. Scale by adding instances deliberately, not --workers.
+    command: uvicorn src.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "${API_HOST_PORT:-8000}:8000"
+      # The Prometheus exporter is scraped over the internal network and is
+      # not published.
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - internal
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      - POSTGRES_DB=cryptoalert
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - internal
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - internal
+
+  prometheus:
+    image: prom/prometheus:v3.16.0
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    ports:
+      - "127.0.0.1:9091:9090"  # UI: localhost only (use an SSH tunnel)
+    restart: unless-stopped
+    networks:
+      - internal
+
+  grafana:
+    image: grafana/grafana:13.3.1
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    ports:
+      - "127.0.0.1:3000:3000"  # localhost only (use an SSH tunnel)
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - internal
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  internal:
+    driver: bridge

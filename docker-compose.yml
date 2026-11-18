@@ -1,0 +1,102 @@
+# Development stack (hot reload, source mounted). For production use
+# docker-compose.prod.yml.
+services:
+  api:
+    build: .
+    container_name: crypto-alert-api
+    # Settings/secrets at runtime (never baked into the image - see .dockerignore).
+    # `environment:` below overrides DATABASE_URL/REDIS_URL with in-network hosts.
+    env_file: .env
+    ports:
+      - "8000:8000"
+      # Prometheus exporter: no app-level auth, so localhost only. Prometheus
+      # scrapes api:9090 over the compose network, which is unaffected.
+      - "127.0.0.1:9090:9090"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/cryptoalert
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - ./src:/app/src
+      - ./logs:/app/logs
+    command: uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - crypto-alert-network
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: crypto-alert-postgres
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=cryptoalert
+    ports:
+      - "127.0.0.1:5432:5432"  # localhost only: default password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - crypto-alert-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: crypto-alert-redis
+    ports:
+      - "127.0.0.1:6379:6379"  # localhost only: no auth
+    volumes:
+      - redis_data:/data
+    networks:
+      - crypto-alert-network
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  prometheus:
+    image: prom/prometheus:v3.16.0
+    container_name: crypto-alert-prometheus
+    ports:
+      - "127.0.0.1:9091:9090"  # Prometheus UI: localhost only
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - crypto-alert-network
+
+  grafana:
+    image: grafana/grafana:13.3.1
+    container_name: crypto-alert-grafana
+    ports:
+      - "127.0.0.1:3000:3000"  # localhost only: admin/admin
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    depends_on:
+      - prometheus
+    networks:
+      - crypto-alert-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  crypto-alert-network:
+    driver: bridge
