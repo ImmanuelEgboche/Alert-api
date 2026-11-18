@@ -1,7 +1,12 @@
 """Unit tests for alert matching engine."""
-import pytest
-from datetime import datetime
+import asyncio
+import uuid
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock
 
+import pytest
+
+from src.config import get_settings
 from src.core.matcher import AlertMatcher
 from src.models import Alert, AlertStatus, AlertCondition
 
@@ -102,12 +107,6 @@ async def test_remove_alert():
 # ---------------------------------------------------------------------------
 # Recurring alerts: fire once per crossing, re-arm after crossing back
 # ---------------------------------------------------------------------------
-import asyncio
-import uuid
-from unittest.mock import AsyncMock
-
-from src.config import get_settings
-
 MARGIN = get_settings().alert_rearm_margin
 
 
@@ -224,7 +223,6 @@ async def test_restore_resets_to_armed(rig):
 # ---------------------------------------------------------------------------
 # Expiry: fire-time check
 # ---------------------------------------------------------------------------
-from datetime import timedelta, timezone
 
 
 async def test_expired_alert_does_not_fire_and_is_removed(rig):

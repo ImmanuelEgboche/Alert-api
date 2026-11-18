@@ -1,7 +1,6 @@
 """Coinbase Pro WebSocket connection implementation."""
 import json
 from datetime import datetime
-from typing import Any
 import structlog
 
 from src.exchanges.base import ExchangeConnection

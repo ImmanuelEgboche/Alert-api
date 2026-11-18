@@ -1,6 +1,5 @@
 """Base class for exchange WebSocket connections."""
 import asyncio
-import json
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime

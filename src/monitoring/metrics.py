@@ -8,7 +8,6 @@ from prometheus_client import (
     Histogram,
     Gauge,
     generate_latest,
-    CONTENT_TYPE_LATEST,
     REGISTRY,
     start_http_server,
 )

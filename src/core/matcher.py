@@ -1,6 +1,4 @@
 """Alert matching engine using Redis sorted sets for O(log n) performance."""
-import asyncio
-import json
 import time
 from datetime import datetime
 from typing import Any

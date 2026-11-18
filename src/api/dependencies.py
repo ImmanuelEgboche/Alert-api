@@ -17,7 +17,6 @@ async def get_alert_matcher() -> "AlertMatcher":
 
     This function is overridden by app.dependency_overrides in main.py
     """
-    from src.core.matcher import AlertMatcher
     raise RuntimeError("AlertMatcher dependency not configured")
 
 
@@ -26,5 +25,4 @@ async def get_connection_manager() -> "ConnectionManager":
 
     This function is overridden by app.dependency_overrides in main.py
     """
-    from src.core.connection_manager import ConnectionManager
     raise RuntimeError("ConnectionManager dependency not configured")
