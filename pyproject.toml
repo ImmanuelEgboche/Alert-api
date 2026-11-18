@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "crypto-alert-api"
-version = "0.1.0"
+version = "1.0.0"
 description = "Production-grade cryptocurrency alert API"
 authors = ["Big O Energy"]
 readme = "README.md"

@@ -27,7 +27,7 @@ class Settings(BaseSettings):
 
     # Application
     app_name: str = "crypto-alert-api"
-    app_version: str = "0.1.0"
+    app_version: str = "1.0.0"
     environment: Literal["development", "staging", "production"] = "development"
     debug: bool = False
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"

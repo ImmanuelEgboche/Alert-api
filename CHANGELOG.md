@@ -4,7 +4,7 @@ All notable changes to this project are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The
 [To do](#to-do) section at the bottom tracks known gaps.
 
-## [Unreleased] - 2026-11-12
+## [1.0.0] - 2026-11-18
 
 The alert pipeline (price feed → match → webhook) now works end to end. It was
 tested against a live Binance BTCUSDT feed, with a signed webhook received by a
