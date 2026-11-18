@@ -553,3 +553,23 @@ async def get_metrics(
         "avg_latency_ms": float(avg_latency_ms),
         "uptime_seconds": uptime_seconds(),
     }
+
+
+@router.get(
+    "/metrics/pipeline",
+    # Operator-only, like /metrics
+    dependencies=[Depends(require_metrics_token)],
+)
+async def get_pipeline_metrics(
+    connection_manager: ConnectionManager = Depends(get_connection_manager),
+) -> dict[str, Any]:
+    """Per-stage latency percentiles and feed completeness since startup.
+
+    Latency covers the most recent samples per stage (bounded buffer); see
+    src/monitoring/latency.py for what each stage measures.
+    """
+    return {
+        "latency": connection_manager.latency.summary(),
+        "feed": connection_manager.sequence.report(),
+        "pending_matches": connection_manager.pending_matches,
+    }

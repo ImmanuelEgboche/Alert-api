@@ -53,6 +53,10 @@ class Settings(BaseSettings):
             problems.append(
                 "WEBHOOK_ALLOW_PRIVATE_URLS must be false (users could reach internal services)"
             )
+        if self.feed_source == "replay":
+            problems.append(
+                "FEED_SOURCE must be live (replay would fire real users' alerts on old prices)"
+            )
         if problems:
             raise ValueError(
                 "Refusing to start with ENVIRONMENT=production: " + "; ".join(problems)
@@ -75,6 +79,7 @@ class Settings(BaseSettings):
     # Redis
     redis_url: RedisDsn = Field(default="redis://localhost:6379/0")
     redis_max_connections: int = 50
+
 
     # Security
     # Server-side secret. Webhooks are signed with each user's own
@@ -107,6 +112,20 @@ class Settings(BaseSettings):
     # REST API used to fetch the list of tradable symbols (alert validation)
     binance_rest_url: str = "https://api.binance.com"
     symbol_refresh_seconds: float = Field(default=3600, gt=0)
+
+    # Price feed source. "live" = exchange WebSockets. "replay" = play
+    # REPLAY_FILE (made with `python -m src.feed.record`) through the same
+    # pipeline instead, for demos and benchmarks. Refused in production.
+    feed_source: Literal["live", "replay"] = "live"
+    replay_file: str | None = None
+    # 1 = real time, N = N x faster, 0 = as fast as possible
+    replay_speed: float = Field(default=1.0, ge=0)
+
+    @model_validator(mode="after")
+    def _replay_needs_file(self) -> "Settings":
+        if self.feed_source == "replay" and not self.replay_file:
+            raise ValueError("FEED_SOURCE=replay requires REPLAY_FILE")
+        return self
 
     # Monitoring
     metrics_enabled: bool = True

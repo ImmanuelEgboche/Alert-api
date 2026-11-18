@@ -70,3 +70,15 @@ def test_debug_logs_are_filtered_at_info():
         logger.debug("price_update")
         logger.info("kept")
     assert [entry["event"] for entry in logs] == ["kept"]
+
+
+def test_replay_feed_requires_a_file():
+    with pytest.raises(ValueError, match="REPLAY_FILE"):
+        Settings(_env_file=None, feed_source="replay")
+
+
+def test_production_refuses_replay_feed():
+    with pytest.raises(ValueError, match="FEED_SOURCE"):
+        Settings(_env_file=None, environment="production", secret_key="x" * 40,
+                 feed_source="replay", replay_file="r.jsonl.gz")
+

@@ -3,7 +3,7 @@ import json
 from datetime import datetime
 import structlog
 
-from src.exchanges.base import ExchangeConnection
+from src.exchanges.base import ExchangeConnection, Tick
 
 logger = structlog.get_logger()
 
@@ -47,7 +47,7 @@ class CoinbaseConnection(ExchangeConnection):
             return f"{base}-USD"
         return symbol
 
-    async def _parse_message(self, message: str) -> tuple[str, float, datetime] | None:
+    async def _parse_message(self, message: str) -> Tick | None:
         """Parse Coinbase message format.
 
         Coinbase ticker message format:
@@ -67,7 +67,12 @@ class CoinbaseConnection(ExchangeConnection):
                 symbol = product_id.replace("-", "")
                 price = float(data["price"])
                 timestamp = datetime.fromisoformat(data["time"].replace("Z", "+00:00"))
-                return symbol, price, timestamp
+                trade_id = data.get("trade_id")
+                return Tick(
+                    symbol=symbol, price=price, timestamp=timestamp,
+                    trade_id=int(trade_id) if trade_id is not None else None,
+                    exchange_ms=int(timestamp.timestamp() * 1000),
+                )
 
         except (json.JSONDecodeError, KeyError, ValueError) as e:
             logger.debug("coinbase_parse_error", message=message, error=str(e))

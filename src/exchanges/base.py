@@ -1,7 +1,9 @@
 """Base class for exchange WebSocket connections."""
 import asyncio
+import inspect
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Any
 import structlog
@@ -15,6 +17,31 @@ from tenacity import (
 )
 
 logger = structlog.get_logger()
+
+
+@dataclass(slots=True)
+class Tick:
+    """One trade, plus the timestamps needed to measure where time goes.
+
+    Wall-clock times (``*_ns`` from time.time_ns) compare against the exchange's
+    own clock; ``recv_mono_ns`` (perf_counter_ns) times our internal stages,
+    which must not jump if NTP adjusts the wall clock.
+    """
+
+    symbol: str
+    price: float
+    timestamp: datetime              # exchange trade time (UTC)
+    trade_id: int | None = None      # per-symbol sequence number, if the exchange has one
+    exchange_ms: int | None = None   # exchange trade time, epoch ms
+    recv_ns: int = 0                 # wall clock when the message arrived (or was recorded)
+    recv_mono_ns: int = 0            # monotonic clock when we started handling it
+
+
+# May be sync or async. An async callback is awaited before the next message is
+# read, which is how a busy pipeline slows the reader instead of dropping trades.
+TickCallback = Callable[[Tick], Any]
+# (recv_wall_ns, raw message) - called for every message, before parsing
+RawHook = Callable[[int, str], None]
 
 
 class ExchangeConnection(ABC):
@@ -31,7 +58,8 @@ class ExchangeConnection(ABC):
         self.symbols = symbols
         self.ws: websockets.WebSocketClientProtocol | None = None
         self.is_connected = False
-        self._callbacks: list[Callable[[str, float, datetime], None]] = []
+        self._callbacks: list[TickCallback] = []
+        self._raw_hooks: list[RawHook] = []
         self._reconnect_task: asyncio.Task[Any] | None = None
         # Strong ref to the read loop (asyncio only keeps weak refs to tasks).
         self._handler_task: asyncio.Task[Any] | None = None
@@ -53,24 +81,62 @@ class ExchangeConnection(ABC):
         pass
 
     @abstractmethod
-    async def _parse_message(self, message: str) -> tuple[str, float, datetime] | None:
+    async def _parse_message(self, message: str) -> Tick | None:
         """Parse exchange-specific message format.
 
         Args:
             message: Raw WebSocket message
 
         Returns:
-            Tuple of (symbol, price, timestamp) or None if not a price update
+            A Tick (receive times are filled in by _dispatch), or None if the
+            message is not a trade (subscription acks, heartbeats, ...)
         """
         pass
 
-    def add_callback(self, callback: Callable[[str, float, datetime], None]) -> None:
-        """Add callback for price updates.
+    def add_callback(self, callback: TickCallback) -> None:
+        """Add callback for price updates; called with each parsed Tick."""
+        self._callbacks.append(callback)
+
+    def add_raw_hook(self, hook: RawHook) -> None:
+        """Add a hook that sees every raw message before parsing (the recorder)."""
+        self._raw_hooks.append(hook)
+
+    async def _dispatch(self, message: str, recv_ns: int | None = None) -> Tick | None:
+        """Parse one raw message and hand the trade to every callback.
+
+        The live WebSocket loop and the replay feed both come through here, so
+        a replayed recording exercises exactly the same parsing and routing.
 
         Args:
-            callback: Function to call with (symbol, price, timestamp)
+            message: Raw message as the exchange sent it
+            recv_ns: When it arrived (wall clock). Live: now. Replay: the time
+                recorded, so exchange->receive delay can still be reported.
         """
-        self._callbacks.append(callback)
+        recv_mono_ns = time.perf_counter_ns()
+        if recv_ns is None:
+            recv_ns = time.time_ns()
+        for hook in self._raw_hooks:
+            try:
+                hook(recv_ns, message)
+            except Exception as e:
+                logger.error("raw_hook_error", error=str(e))
+        try:
+            tick = await self._parse_message(message)
+        except Exception as e:
+            logger.error("message_parse_error", message=message, error=str(e))
+            return None
+        if tick is None:
+            return None
+        tick.recv_ns = recv_ns
+        tick.recv_mono_ns = recv_mono_ns
+        for callback in self._callbacks:
+            try:
+                result = callback(tick)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as e:
+                logger.error("callback_error", symbol=tick.symbol, price=tick.price, error=str(e))
+        return tick
 
     # Retry forever with capped exponential backoff: a price feed that gives up
     # permanently is worse than one that keeps trying every 60s. Network-level
@@ -121,23 +187,7 @@ class ExchangeConnection(ABC):
 
         try:
             async for message in ws:
-                try:
-                    parsed = await self._parse_message(message)
-                    if parsed:
-                        symbol, price, timestamp = parsed
-                        # Call all registered callbacks
-                        for callback in self._callbacks:
-                            try:
-                                callback(symbol, price, timestamp)
-                            except Exception as e:
-                                logger.error(
-                                    "callback_error",
-                                    symbol=symbol,
-                                    price=price,
-                                    error=str(e),
-                                )
-                except Exception as e:
-                    logger.error("message_parse_error", message=message, error=str(e))
+                await self._dispatch(message if isinstance(message, str) else message.decode())
 
             logger.warning(
                 "websocket_closed", url=self.ws_url,

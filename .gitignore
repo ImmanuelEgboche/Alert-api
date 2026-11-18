@@ -71,3 +71,6 @@ grafana_data/
 .mypy_cache/
 .dmypy.json
 dmypy.json
+
+# Feed recordings (large; regenerate with `make record`)
+recordings/

@@ -14,7 +14,9 @@ from src.config import get_settings
 from src.database import AsyncSessionLocal
 from sqlalchemy import select
 
+from src.exchanges.base import Tick
 from src.models import User, WebhookLog, WebhookStatus
+from src.monitoring.latency import LatencyRecorder, pipeline_latency
 from src.schemas import WebhookPayload
 from src.webhooks.url_safety import UnsafeWebhookURL, create_safe_transport
 
@@ -41,8 +43,9 @@ class WebhookDelivery:
       backoff, and never block putting items back on their own queue.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, latency: LatencyRecorder | None = None) -> None:
         """Initialize webhook delivery system."""
+        self.latency = latency if latency is not None else pipeline_latency
         self.client: httpx.AsyncClient | None = None
         self.delivery_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
             maxsize=settings.max_webhook_queue_size
@@ -115,6 +118,7 @@ class WebhookDelivery:
         alert_data: dict[str, Any],
         current_price: float,
         timestamp: datetime,
+        tick: Tick | None = None,
     ) -> None:
         """Queue webhook for delivery.
 
@@ -126,6 +130,7 @@ class WebhookDelivery:
             alert_data: Alert data from matcher
             current_price: Current price that triggered alert
             timestamp: Trigger timestamp
+            tick: The trade that fired it (for end-to-end latency), if known
         """
         webhook_data = {
             "alert_id": int(alert_data["id"]),
@@ -133,6 +138,8 @@ class WebhookDelivery:
             "current_price": current_price,
             "timestamp": timestamp,
             "retry_count": 0,
+            "tick": tick,
+            "queued_mono_ns": time.perf_counter_ns(),
         }
 
         try:
@@ -180,6 +187,10 @@ class WebhookDelivery:
         retry_count = webhook_data["retry_count"]
 
         webhook_url = alert_data["webhook_url"]
+        if retry_count == 0 and "queued_mono_ns" in webhook_data:
+            self.latency.record(
+                "webhook_queue_wait", time.perf_counter_ns() - webhook_data["queued_mono_ns"]
+            )
 
         try:
             secret = await self._get_signing_secret(int(alert_data["user_id"]))
@@ -220,7 +231,7 @@ class WebhookDelivery:
             response_time_ms = (time.perf_counter() - start_time) * 1000
 
             if response.is_success:
-                # Success
+                self._record_delivery_latency(webhook_data, response_time_ms)
                 await self._log_delivery(
                     alert_id,
                     WebhookStatus.DELIVERED.value,
@@ -262,6 +273,21 @@ class WebhookDelivery:
             await self._handle_delivery_failure(
                 webhook_data, f"{type(e).__name__}: {e}", None, response_time_ms, retryable=False
             )
+
+    def _record_delivery_latency(self, webhook_data: dict[str, Any], http_ms: float) -> None:
+        """HTTP time, plus end-to-end times when the originating trade is known.
+
+        End-to-end includes any retry backoff: that is real delay the user saw.
+        """
+        self.latency.record("webhook_http", int(http_ms * 1e6))
+        tick: Tick | None = webhook_data.get("tick")
+        if tick is None or not tick.recv_mono_ns:
+            return
+        internal = time.perf_counter_ns() - tick.recv_mono_ns
+        self.latency.record("receive_to_delivered", internal)
+        if tick.exchange_ms is not None and tick.recv_ns:
+            network = tick.recv_ns - tick.exchange_ms * 1_000_000
+            self.latency.record("exchange_to_delivered", network + internal)
 
     async def _send_webhook(
         self, url: str, payload: str, signature: str

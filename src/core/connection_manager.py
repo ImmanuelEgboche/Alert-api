@@ -1,7 +1,7 @@
 """Manage WebSocket connections to multiple exchanges."""
 import asyncio
+import time
 from collections import defaultdict
-from datetime import datetime
 from typing import Any
 import structlog
 from sqlalchemy import distinct, select
@@ -10,10 +10,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.config import get_settings
 from src.database import AsyncSessionLocal
 from src.models import Alert, AlertStatus
-from src.exchanges.base import ExchangeConnection
+from src.exchanges.base import ExchangeConnection, Tick
 from src.exchanges.binance import BinanceConnection
 from src.exchanges.coinbase import CoinbaseConnection
 from src.core.matcher import AlertMatcher
+from src.feed.completeness import TradeSequenceChecker
+from src.monitoring.latency import LatencyRecorder, pipeline_latency
 
 logger = structlog.get_logger()
 settings = get_settings()
@@ -26,18 +28,28 @@ class ConnectionManager:
     Multiplexes multiple alerts onto single connections for efficiency.
     """
 
-    def __init__(self, matcher: AlertMatcher) -> None:
+    def __init__(
+        self,
+        matcher: AlertMatcher,
+        latency: LatencyRecorder | None = None,
+        sequence: TradeSequenceChecker | None = None,
+    ) -> None:
         """Initialize connection manager.
 
         Args:
             matcher: Alert matching engine
+            latency: Where stage timings go (default: the process-wide recorder)
+            sequence: Trade-ID gap/duplicate tracker (default: a fresh one)
         """
         self.matcher = matcher
+        self.latency = latency if latency is not None else pipeline_latency
+        self.sequence = sequence if sequence is not None else TradeSequenceChecker()
         self.connections: dict[str, dict[str, Any]] = {
             "binance": {},
             "coinbase": {},
         }
         self.symbol_subscriptions: dict[str, set[str]] = defaultdict(set)
+
         # Strong refs to in-flight match tasks: asyncio only keeps weak refs,
         # so un-referenced tasks can be garbage-collected mid-execution.
         self._pending_tasks: set[asyncio.Task[Any]] = set()
@@ -109,15 +121,31 @@ class ConnectionManager:
     def _build_connection(self, exchange: str, symbols: list[str]) -> ExchangeConnection:
         """Construct (but don't connect) a connection to an exchange."""
         connection: ExchangeConnection
-        if exchange == "binance":
+        if settings.feed_source == "replay" and exchange == "binance":
+            # Same pipeline, recorded prices: plays only subscribed symbols,
+            # and add_symbols() widens that just like a live SUBSCRIBE.
+            from src.feed.replay import ReplayConnection
+            connection = ReplayConnection(
+                settings.replay_file or "", symbols, speed=settings.replay_speed
+            )
+        elif exchange == "binance":
             connection = BinanceConnection(settings.binance_ws_url, symbols)
         elif exchange == "coinbase":
             connection = CoinbaseConnection(settings.coinbase_ws_url, symbols)
         else:
             raise ValueError(f"Unsupported exchange: {exchange}")
 
-        connection.add_callback(self._on_price_update)
+        connection.add_callback(lambda tick: self._on_price_update(tick, exchange))
         return connection
+
+    def attach_feed(self, connection: ExchangeConnection, exchange: str = "binance") -> None:
+        """Route an externally built feed (e.g. a replay) into this pipeline."""
+        connection.add_callback(lambda tick: self._on_price_update(tick, exchange))
+
+    @property
+    def pending_matches(self) -> int:
+        """Trades being matched right now."""
+        return len(self._pending_tasks)
 
     async def _connect_in_background(self, exchange: str, connection: ExchangeConnection) -> None:
         """Connect, logging rather than raising (nobody awaits this task)."""
@@ -129,33 +157,44 @@ class ConnectionManager:
         except Exception as e:
             logger.error("exchange_connect_failed", exchange=exchange, error=str(e))
 
-    def _on_price_update(self, symbol: str, price: float, timestamp: datetime) -> None:
-        """Callback for price updates from exchanges.
+    def _on_price_update(self, tick: Tick, exchange: str = "binance") -> None:
+        """Callback for each trade from an exchange (live or replayed)."""
+        if tick.exchange_ms is not None and tick.recv_ns:
+            self.latency.record("exchange_to_receive", tick.recv_ns - tick.exchange_ms * 1_000_000)
 
-        Args:
-            symbol: Trading pair symbol
-            price: Current price
-            timestamp: Update timestamp
-        """
-        task = asyncio.create_task(self._match_with_own_session(symbol, price, timestamp))
+        if tick.trade_id is not None:
+            kind, n = self.sequence.observe(f"{exchange}:{tick.symbol}", tick.trade_id)
+            if kind == "gap":
+                # Expected right after a reconnect; anywhere else, trades were lost
+                logger.warning("trade_gap", exchange=exchange, symbol=tick.symbol,
+                               missing=n, resumed_at_id=tick.trade_id)
+            elif kind != "ok":
+                logger.warning("trade_sequence_anomaly", exchange=exchange,
+                               symbol=tick.symbol, kind=kind, trade_id=tick.trade_id)
+
+        task = asyncio.create_task(self._match_with_own_session(tick))
         self._pending_tasks.add(task)
         task.add_done_callback(self._pending_tasks.discard)
 
-        logger.debug("price_update", symbol=symbol, price=price, timestamp=timestamp)
-
-    async def _match_with_own_session(
-        self, symbol: str, price: float, timestamp: datetime
-    ) -> None:
+    async def _match_with_own_session(self, tick: Tick) -> None:
         """Run matching for one price update in its own DB session.
 
         AsyncSession is not safe for concurrent use, and price updates arrive
-        concurrently, so each update gets a short-lived session from the pool.
+        concurrently, so each update gets a short-lived session from the pool
+        (it only takes a DB connection if an alert actually fires).
         """
+        start = time.perf_counter_ns()
+        if tick.recv_mono_ns:
+            self.latency.record("receive_to_match_start", start - tick.recv_mono_ns)
         try:
             async with AsyncSessionLocal() as session:
-                await self.matcher.match_price_update(symbol, price, timestamp, session)
+                await self.matcher.match_price_update(
+                    tick.symbol, tick.price, tick.timestamp, session, tick=tick
+                )
         except Exception as e:
-            logger.error("price_match_failed", symbol=symbol, price=price, error=str(e))
+            logger.error("price_match_failed", symbol=tick.symbol, price=tick.price, error=str(e))
+        finally:
+            self.latency.record("match", time.perf_counter_ns() - start)
 
     async def disconnect_all(self) -> None:
         """Disconnect from all exchanges."""

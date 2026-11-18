@@ -91,3 +91,27 @@ def test_prometheus_exporter_serves_on_metrics_port(monkeypatch):
     response = httpx.get(f"http://127.0.0.1:{port}/metrics", timeout=5)
     assert response.status_code == 200
     assert "http_requests_total" in response.text
+
+
+async def test_pipeline_metrics_require_operator_token(client: AsyncClient, token_configured):
+    assert (await client.get(URL + "/pipeline")).status_code == 401
+
+
+async def test_pipeline_metrics_report_latency_and_feed(client: AsyncClient, token_configured):
+    from src.api import dependencies as deps
+    from src.core.connection_manager import ConnectionManager
+    from src.feed.completeness import TradeSequenceChecker
+    from src.main import app
+    from src.monitoring.latency import LatencyRecorder
+
+    manager = ConnectionManager(None, latency=LatencyRecorder(), sequence=TradeSequenceChecker())
+    manager.latency.record("match", 2_000_000)
+    manager.sequence.observe("binance:BTCUSDT", 1)
+    manager.sequence.observe("binance:BTCUSDT", 3)
+    app.dependency_overrides[deps.get_connection_manager] = lambda: manager
+    response = await client.get(URL + "/pipeline", headers={"Authorization": f"Bearer {TOKEN}"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["latency"]["match"]["p50_ms"] == 2.0
+    assert body["feed"]["total"]["missing"] == 1
+    assert body["pending_matches"] == 0

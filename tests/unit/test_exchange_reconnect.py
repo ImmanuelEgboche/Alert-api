@@ -83,7 +83,7 @@ async def make_conn(exchange):
         # immediately (like Binance's 24h close) without slowing the tests.
         conn.STABLE_AFTER_SECONDS = stable_after
         prices: list[float] = []
-        conn.add_callback(lambda s, p, t: prices.append(p))
+        conn.add_callback(lambda tick: prices.append(tick.price))
         conns.append(conn)
         return conn, prices
 

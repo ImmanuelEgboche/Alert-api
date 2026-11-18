@@ -11,6 +11,7 @@ from sqlalchemy import select, update
 from src.models import Alert, AlertStatus, AlertCondition
 from src.database import get_redis
 from src.config import get_settings
+from src.exchanges.base import Tick
 
 logger = structlog.get_logger()
 settings = get_settings()
@@ -145,7 +146,12 @@ class AlertMatcher:
         logger.debug("removed_alert", alert_id=alert_id, symbol=symbol)
 
     async def match_price_update(
-        self, symbol: str, price: float, timestamp: datetime, session: AsyncSession
+        self,
+        symbol: str,
+        price: float,
+        timestamp: datetime,
+        session: AsyncSession,
+        tick: Tick | None = None,
     ) -> list[Alert]:
         """Match price update against active alerts.
 
@@ -154,6 +160,8 @@ class AlertMatcher:
             price: Current price
             timestamp: Update timestamp
             session: Database session
+            tick: The originating trade, passed on to trigger callbacks so
+                webhook delivery can measure end-to-end latency
 
         Returns:
             List of triggered alerts
@@ -188,7 +196,7 @@ class AlertMatcher:
 
         # Process triggered alerts
         if triggered:
-            await self._process_triggered_alerts(triggered, price, timestamp, session)
+            await self._process_triggered_alerts(triggered, price, timestamp, session, tick)
 
         return triggered
 
@@ -322,7 +330,12 @@ class AlertMatcher:
         return threshold * (1 + margin)
 
     async def _process_triggered_alerts(
-        self, alerts: list[Any], price: float, timestamp: datetime, session: AsyncSession
+        self,
+        alerts: list[Any],
+        price: float,
+        timestamp: datetime,
+        session: AsyncSession,
+        tick: Tick | None = None,
     ) -> None:
         """Process triggered alerts: update status, remove or keep based on recurring.
 
@@ -332,6 +345,7 @@ class AlertMatcher:
             timestamp: Trigger timestamp
             session: Database session
         """
+        extra = {"tick": tick} if tick is not None else {}
         for alert_data in alerts:
             alert_id = int(alert_data["id"])
             is_recurring = alert_data["is_recurring"] == "True"
@@ -356,7 +370,7 @@ class AlertMatcher:
             # Notify callbacks (webhook delivery)
             for callback in self._triggered_callbacks:
                 try:
-                    await callback(alert_data, price, timestamp)
+                    await callback(alert_data, price, timestamp, **extra)
                 except Exception as e:
                     logger.error("callback_error", alert_id=alert_id, error=str(e))
 

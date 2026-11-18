@@ -1,9 +1,9 @@
 """Binance WebSocket connection implementation."""
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 import structlog
 
-from src.exchanges.base import ExchangeConnection
+from src.exchanges.base import ExchangeConnection, Tick
 
 logger = structlog.get_logger()
 
@@ -37,15 +37,17 @@ class BinanceConnection(ExchangeConnection):
         await self.ws.send(json.dumps(subscribe_msg))
         logger.info("subscribed_to_binance", streams=streams)
 
-    async def _parse_message(self, message: str) -> tuple[str, float, datetime] | None:
+    async def _parse_message(self, message: str) -> Tick | None:
         """Parse Binance message format.
 
         Binance trade message format:
         {
             "e": "trade",
+            "E": 1234567890001,   # event time (ms)
             "s": "BTCUSDT",
+            "t": 12345,           # trade ID: +1 per trade, per symbol
             "p": "50000.00",
-            "T": 1234567890000
+            "T": 1234567890000    # trade time (ms)
         }
         """
         try:
@@ -56,10 +58,17 @@ class BinanceConnection(ExchangeConnection):
                 data = data["data"]
 
             if data.get("e") == "trade":
-                symbol = data["s"]
-                price = float(data["p"])
-                timestamp = datetime.fromtimestamp(data["T"] / 1000)
-                return symbol, price, timestamp
+                trade_ms = int(data["T"])
+                trade_id = data.get("t")
+                return Tick(
+                    symbol=data["s"],
+                    price=float(data["p"]),
+                    # UTC-aware: a naive local time would be stored wrong in
+                    # timestamptz columns (triggered_at) on a non-UTC server
+                    timestamp=datetime.fromtimestamp(trade_ms / 1000, tz=timezone.utc),
+                    trade_id=int(trade_id) if trade_id is not None else None,
+                    exchange_ms=trade_ms,
+                )
 
         except (json.JSONDecodeError, KeyError, ValueError) as e:
             logger.debug("binance_parse_error", message=message, error=str(e))
