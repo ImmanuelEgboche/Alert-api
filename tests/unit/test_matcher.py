@@ -250,3 +250,37 @@ async def test_recurring_alert_expiring_while_waiting_to_rearm(rig):
     await tick(50100)                          # would fire #2 - must not
     assert len(fired) == 1
     assert await matcher.redis.exists(f"alert:{alert.id}") == 0
+
+
+async def test_quiet_trade_is_one_redis_round_trip(rig):
+    """The hot path: a trade that fires and re-arms nothing makes exactly one
+    Redis call (a pipeline), not one call per sorted-set lookup."""
+    matcher, _, fired, tick, add = rig
+    await add(threshold=50000.0)
+    calls = 0
+    real_execute = matcher.redis.connection_pool.get_connection
+
+    async def counting(*a, **kw):
+        nonlocal calls
+        calls += 1
+        return await real_execute(*a, **kw)
+
+    matcher.redis.connection_pool.get_connection = counting
+    try:
+        await tick(49000)   # below threshold: nothing to fire or re-arm
+    finally:
+        matcher.redis.connection_pool.get_connection = real_execute
+    assert calls == 1 and fired == []
+
+
+async def test_rearm_and_fire_on_the_same_trade_at_zero_margin(rig, monkeypatch):
+    """With no margin, a trade exactly at the threshold re-arms a waiting
+    recurring alert AND fires it - same as before the lookups were batched."""
+    from src.core import matcher as matcher_mod
+
+    monkeypatch.setattr(matcher_mod.settings, "alert_rearm_margin", 0.0)
+    _, _, fired, tick, add = rig
+    await add(threshold=50000.0)
+    await tick(50100)       # fire #1, parked for re-arm at exactly 50000
+    await tick(50000)       # re-arms (<= 50000) and matches (>= 50000)
+    assert len(fired) == 2

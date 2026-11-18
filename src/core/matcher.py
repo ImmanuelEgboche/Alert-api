@@ -170,21 +170,32 @@ class AlertMatcher:
             return []
 
         triggered: list[Alert] = []
+        above = AlertCondition.PRICE_ABOVE.value
+        below = AlertCondition.PRICE_BELOW.value
 
-        # Re-arm recurring alerts whose price has crossed back past their re-arm level
-        await self._rearm_crossed_back(symbol, price)
+        # All four lookups in ONE Redis round trip. Most trades fire and
+        # re-arm nothing, so this is usually the only Redis call for the
+        # trade (it used to be four sequential calls; replay benchmarks showed
+        # the round trips were most of the per-trade cost).
+        pipe = self.redis.pipeline(transaction=False)
+        pipe.zrangebyscore(self._rearm_key(symbol, above), price, "+inf")   # re-arm level >= price
+        pipe.zrangebyscore(self._rearm_key(symbol, below), "-inf", price)   # re-arm level <= price
+        pipe.zrangebyscore(self._armed_key(symbol, above), "-inf", price)   # threshold <= price
+        pipe.zrangebyscore(self._armed_key(symbol, below), price, "+inf")   # threshold >= price
+        rearm_above, rearm_below, hit_above, hit_below = await pipe.execute()
 
-        # Match price_above alerts (threshold <= price)
-        above_alerts = await self._match_condition(
-            symbol, AlertCondition.PRICE_ABOVE.value, price, "max"
-        )
-        triggered.extend(above_alerts)
+        # Re-arm first, as before. An alert re-armed by this trade could also
+        # match it (only at ALERT_REARM_MARGIN=0 with price exactly at the
+        # threshold), so re-query that condition rather than change behaviour.
+        if rearm_above and await self._rearm_ids(symbol, above, rearm_above, price):
+            hit_above = await self.redis.zrangebyscore(self._armed_key(symbol, above), "-inf", price)
+        if rearm_below and await self._rearm_ids(symbol, below, rearm_below, price):
+            hit_below = await self.redis.zrangebyscore(self._armed_key(symbol, below), price, "+inf")
 
-        # Match price_below alerts (threshold >= price)
-        below_alerts = await self._match_condition(
-            symbol, AlertCondition.PRICE_BELOW.value, price, "min"
-        )
-        triggered.extend(below_alerts)
+        if hit_above:
+            triggered.extend(await self._claim(symbol, above, hit_above))
+        if hit_below:
+            triggered.extend(await self._claim(symbol, below, hit_below))
 
         # Fire-time expiry check: the guarantee that an expired alert never fires,
         # regardless of when the background sweeper last ran.
@@ -253,7 +264,13 @@ class AlertMatcher:
         else:
             # price_below: Get alerts where threshold >= price
             alert_ids = await self.redis.zrangebyscore(armed_key, price, "+inf")
+        return await self._claim(symbol, condition, alert_ids)
 
+    async def _claim(self, symbol: str, condition: str, alert_ids: list[str]) -> list[Any]:
+        """Atomically claim each candidate (ZREM); return the ones we won."""
+        if self.redis is None:
+            return []
+        armed_key = self._armed_key(symbol, condition)
         alerts = []
         for alert_id in alert_ids:
             # Atomic claim: lose the race -> another task already fired it
@@ -272,39 +289,34 @@ class AlertMatcher:
 
         return alerts  # type: ignore
 
-    async def _rearm_crossed_back(self, symbol: str, price: float) -> int:
+    async def _rearm_ids(
+        self, symbol: str, condition: str, alert_ids: list[str], price: float
+    ) -> int:
         """Move recurring alerts back to armed once price crosses back past re-arm level.
 
         price_above re-arms when price <= threshold * (1 - margin)
         price_below re-arms when price >= threshold * (1 + margin)
 
-        The re-arm set is scored by re-arm price, so this is one O(log n + k)
-        range query per condition, same as matching.
+        alert_ids come from a range query on the re-arm set (scored by re-arm
+        price), so finding them is O(log n + k), same as matching.
 
         Returns:
             Number of alerts re-armed
         """
         if self.redis is None:
             return 0
-
+        rearm_key = self._rearm_key(symbol, condition)
         rearmed = 0
-        for condition, lo, hi in (
-            (AlertCondition.PRICE_ABOVE.value, price, "+inf"),  # re-arm level >= price
-            (AlertCondition.PRICE_BELOW.value, "-inf", price),  # re-arm level <= price
-        ):
-            rearm_key = self._rearm_key(symbol, condition)
-            alert_ids = await self.redis.zrangebyscore(rearm_key, lo, hi)
-            for alert_id in alert_ids:
-                # Same claim pattern: only one task moves it back
-                if await self.redis.zrem(rearm_key, alert_id) == 0:
-                    continue
-                threshold = await self.redis.hget(f"alert:{alert_id}", "threshold")
-                if threshold is None:
-                    continue  # alert deleted while waiting to re-arm
-                await self.redis.zadd(self._armed_key(symbol, condition), {alert_id: float(threshold)})
-                rearmed += 1
-                logger.debug("alert_rearmed", alert_id=alert_id, symbol=symbol, price=price)
-
+        for alert_id in alert_ids:
+            # Same claim pattern: only one task moves it back
+            if await self.redis.zrem(rearm_key, alert_id) == 0:
+                continue
+            threshold = await self.redis.hget(f"alert:{alert_id}", "threshold")
+            if threshold is None:
+                continue  # alert deleted while waiting to re-arm
+            await self.redis.zadd(self._armed_key(symbol, condition), {alert_id: float(threshold)})
+            rearmed += 1
+            logger.debug("alert_rearmed", alert_id=alert_id, symbol=symbol, price=price)
         return rearmed
 
     @staticmethod
