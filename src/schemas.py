@@ -4,6 +4,9 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, HttpUrl, EmailStr, field_validator
 
+from src.config import get_settings
+from src.webhooks.url_safety import check_url_static
+
 
 # Conditions the matcher actually implements. price_change_percent exists in
 # AlertCondition but has no matching logic (and no defined reference price), so
@@ -27,6 +30,17 @@ def validate_future_expiry(v: Optional[datetime]) -> Optional[datetime]:
         v = v.replace(tzinfo=timezone.utc)
     if v <= datetime.now(timezone.utc):
         raise ValueError("expires_at must be in the future")
+    return v
+
+
+def validate_webhook_url(v: Optional[HttpUrl]) -> Optional[HttpUrl]:
+    """Reject webhook URLs aimed at internal hosts (SSRF), with a clear 422.
+
+    Delivery re-checks the resolved IP on every attempt; this is the early,
+    DNS-free check so users hear about a bad URL when they set it.
+    """
+    if v is not None and not get_settings().webhook_allow_private_urls:
+        check_url_static(str(v))
     return v
 
 
@@ -87,6 +101,8 @@ class AlertCreate(BaseModel):
             raise ValueError(f"Condition must be one of: {', '.join(SUPPORTED_CONDITIONS)}")
         return v
 
+    _check_webhook_url = field_validator("webhook_url")(validate_webhook_url)
+
     @field_validator("expires_at")
     @classmethod
     def validate_expires_at(cls, v: Optional[datetime]) -> Optional[datetime]:
@@ -102,6 +118,8 @@ class AlertUpdate(BaseModel):
     status: Optional[UserSettableStatus] = None
     is_recurring: Optional[bool] = None
     expires_at: Optional[datetime] = None
+
+    _check_webhook_url = field_validator("webhook_url")(validate_webhook_url)
 
     @field_validator("expires_at")
     @classmethod

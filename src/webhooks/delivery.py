@@ -15,6 +15,7 @@ from src.config import get_settings
 from src.database import AsyncSessionLocal
 from src.models import WebhookLog, WebhookStatus
 from src.schemas import WebhookPayload
+from src.webhooks.url_safety import UnsafeWebhookURL, create_safe_transport
 
 logger = structlog.get_logger()
 settings = get_settings()
@@ -52,9 +53,18 @@ class WebhookDelivery:
 
     async def initialize(self) -> None:
         """Initialize HTTP client and start the worker pool."""
+        limits = httpx.Limits(max_keepalive_connections=100, max_connections=200)
+        # SSRF guard: every connection is vetted at connect time (see url_safety).
+        # follow_redirects stays False: a redirect could point anywhere.
+        transport = (
+            httpx.AsyncHTTPTransport(limits=limits)
+            if settings.webhook_allow_private_urls
+            else create_safe_transport(limits)
+        )
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(settings.webhook_timeout_seconds),
-            limits=httpx.Limits(max_keepalive_connections=100, max_connections=200),
+            transport=transport,
+            follow_redirects=False,
         )
         self._is_running = True
         self._worker_tasks = [
@@ -213,7 +223,13 @@ class WebhookDelivery:
                     retryable=is_retryable_status(response.status_code),
                 )
 
-        except httpx.TransportError as e:
+        except UnsafeWebhookURL as e:
+            # SSRF guard: never retried, and the attempt never left the server
+            logger.warning("webhook_blocked_unsafe_url", alert_id=alert_id, reason=str(e))
+            await self._handle_delivery_failure(
+                webhook_data, f"Blocked: {e}", None, 0.0, retryable=False
+            )
+        except (httpx.TransportError, OSError) as e:
             # Network-level: timeout, DNS, refused, reset - transient, retry
             response_time_ms = (time.perf_counter() - start_time) * 1000
             await self._handle_delivery_failure(
@@ -238,6 +254,9 @@ class WebhookDelivery:
 
         Returns:
             HTTP response
+
+        Raises:
+            UnsafeWebhookURL: if the host resolves to a non-public address
         """
         if self.client is None:
             raise RuntimeError("WebhookDelivery not initialized")

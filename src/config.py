@@ -49,6 +49,10 @@ class Settings(BaseSettings):
             problems.append("SECRET_KEY is a published placeholder")
         elif len(self.secret_key) < MIN_SECRET_KEY_LENGTH:
             problems.append(f"SECRET_KEY must be at least {MIN_SECRET_KEY_LENGTH} characters")
+        if self.webhook_allow_private_urls:
+            problems.append(
+                "WEBHOOK_ALLOW_PRIVATE_URLS must be false (users could reach internal services)"
+            )
         if problems:
             raise ValueError(
                 "Refusing to start with ENVIRONMENT=production: " + "; ".join(problems)
@@ -86,6 +90,10 @@ class Settings(BaseSettings):
     webhook_retry_delay_seconds: float = 2.0
     # Concurrent delivery workers; one slow endpoint only ties up one of them
     webhook_workers: int = Field(default=10, ge=1)
+    # Allow webhooks to localhost/private networks. For local testing ONLY:
+    # it lets any user make the server POST to internal services (SSRF).
+    # Refused when ENVIRONMENT=production.
+    webhook_allow_private_urls: bool = False
 
     # WebSocket Exchanges
     binance_ws_url: str = "wss://stream.binance.com:9443"
