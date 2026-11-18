@@ -11,10 +11,11 @@
 ## What We Built
 
 A real-time cryptocurrency price monitoring service that:
-- Monitors multiple exchanges (Binance, Coinbase Pro)
-- Processes 100K+ alerts per day
-- Delivers webhooks with <50ms p99 latency
-- Scales horizontally with 99.9% uptime guarantee
+- Streams live trades from Binance (a Coinbase adapter exists, not yet wired up)
+- Matches them against alerts with Redis sorted sets (O(log n + k) per trade)
+- Delivers signed webhooks with retries, backoff and per-attempt logging
+
+Performance has not been benchmarked yet, so this document makes no latency, throughput or uptime claims.
 
 ---
 
@@ -135,7 +136,7 @@ crypto-alert-api/
 ### 2. Reliability Engineering
 ✅ Automatic WebSocket reconnection with exponential backoff
 ✅ Webhook retry logic (3 attempts, exponential backoff)
-✅ Circuit breaker pattern for failing endpoints
+✅ Non-retryable errors fail fast (no retry storm on 404s)
 ✅ Dead letter queue for failed webhooks
 ✅ Health checks for all services
 ✅ Graceful shutdown handling
@@ -177,20 +178,8 @@ crypto-alert-api/
 
 ## Performance Benchmarks
 
-### Latency (p99)
-- Alert Matching: **8ms** (target: <50ms) ✅
-- API Response: **45ms** (target: <100ms) ✅
-- Webhook Delivery: **150ms** (target: <200ms) ✅
-
-### Throughput
-- Price Updates: **1,000+ updates/sec**
-- Alert Triggers: **10,000+ alerts/hour**
-- Daily Capacity: **200K+ alerts/day** ✅
-
-### Resource Efficiency
-- Memory: **85MB per 10K alerts** (8.5KB/alert)
-- CPU: **30% on 2 cores** (under load)
-- Network: **<1 Mbps per connection**
+Not measured yet. Planned: matching latency at 1K/10K/100K alerts, trades per
+second sustained, and memory per alert, with a script to reproduce them.
 
 ---
 
@@ -239,15 +228,12 @@ crypto-alert-api/
 ### System Design Topics Covered
 ✅ Performance optimization (O(log n) algorithms)
 ✅ Scalability (horizontal scaling, sharding)
-✅ Reliability (retries, circuit breakers, health checks)
+✅ Reliability (retries with backoff, reconnects, health checks)
 ✅ Monitoring (metrics, logging, alerting)
 ✅ Trade-offs (Redis vs in-memory, sync vs async)
-✅ Data structures (sorted sets, interval trees)
+✅ Data structures (sorted sets)
 
 ### Quantifiable Metrics for CV
-✅ **<50ms p99 latency** achieved
-✅ **99.9% uptime** architecture
-✅ **100K+ alerts/day** capacity
 ✅ **O(log n + k)** matching complexity
 ✅ **2,500 lines** production code
 ✅ **80%+ test coverage**
@@ -311,11 +297,10 @@ docker-compose -f docker-compose.prod.yml up -d
 ## Success Criteria Achievement
 
 ### Technical Metrics (for CV)
-- ✅ P99 latency < 50ms (actual: 8ms)
-- ✅ 99.9% uptime architecture implemented
-- ✅ 100K+ alerts/day capacity proven
-- ✅ Multi-exchange support (Binance, Coinbase)
-- ✅ Horizontal scaling demonstrated
+- [ ] Latency and throughput benchmarked (not yet)
+- [ ] Uptime measured on a public deployment (not yet)
+- [ ] Second exchange wired up (Coinbase adapter exists)
+- [ ] More than one API instance demonstrated
 
 ### Code Quality
 - ✅ Production-ready architecture
@@ -327,7 +312,6 @@ docker-compose -f docker-compose.prod.yml up -d
 
 ### Interview Readiness
 - ✅ Detailed technical documentation
-- ✅ Performance benchmarks
 - ✅ Trade-off analysis
 - ✅ Scaling strategy
 - ✅ Demo-ready system
@@ -338,17 +322,17 @@ docker-compose -f docker-compose.prod.yml up -d
 ## Key Interview Talking Points
 
 ### 30-Second Pitch
-"I built a production-grade crypto alert API that processes 100K+ alerts daily with sub-10ms matching latency using Redis sorted sets. The system demonstrates systems thinking through WebSocket multiplexing for efficiency, async webhook delivery for reliability, and comprehensive Prometheus monitoring."
+"I built a crypto alert API that streams live Binance trades, matches them against alerts in O(log n + k) with Redis sorted sets, and delivers signed webhooks through a worker pool with retries. Along the way I fixed real concurrency and reliability bugs: double-firing alerts, a shared DB session across tasks, and a feed that silently died after 24 hours. It also blocks SSRF via webhook URLs, which is the main risk in letting users choose where the server sends requests."
 
 ### Technical Highlights
 1. **Algorithm**: O(log n) matching with Redis sorted sets
 2. **Efficiency**: WebSocket multiplexing (1000:1 connection reduction)
-3. **Reliability**: Exponential backoff retries + circuit breakers
+3. **Reliability**: Exponential backoff retries with jitter; self-healing exchange feed
 4. **Scalability**: Horizontal scaling with stateless architecture
-5. **Observability**: 15+ Prometheus metrics + Grafana dashboards
+5. **Observability**: HTTP metrics in Prometheus, structured logs, readiness checks
 
 ### Trade-offs Made
-- Redis vs in-memory (chose persistence over ~1ms latency)
+- Redis vs in-memory (chose shared state across instances over a network round trip)
 - Async vs sync webhooks (chose throughput over immediate confirmation)
 - PostgreSQL vs NoSQL (chose ACID for critical user data)
 

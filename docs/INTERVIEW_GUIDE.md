@@ -6,7 +6,11 @@ This guide helps you present this project effectively in technical interviews at
 
 ## Executive Summary (30 seconds)
 
-> "I built a production-grade crypto alert API that monitors prices across multiple exchanges and sends webhooks when conditions trigger. It handles 100K+ alerts daily with <50ms p99 latency using Redis sorted sets for O(log n) matching. The system demonstrates systems thinking through WebSocket multiplexing, reliable webhook delivery with retries, and comprehensive monitoring with Prometheus."
+> "I built a crypto alert API that streams live Binance trades and sends signed webhooks when price conditions trigger. Redis sorted sets make matching O(log n + k) per trade instead of scanning every alert, one WebSocket carries every symbol, and webhook delivery runs on a worker pool with retries and backoff. It's hardened for other users: SSRF-safe webhook URLs, per-user signing secrets, rate limits and key rotation."
+
+> **Don't quote latency or throughput numbers.** Nothing has been benchmarked
+> yet. If asked, say so and explain how you'd measure it (see "What's your p99
+> latency" below). That answer lands better than an unbacked number.
 
 ## Key Technical Highlights
 
@@ -26,13 +30,10 @@ await redis.zadd(f"symbol:{symbol}:price_above", {alert_id: threshold})
 triggered = await redis.zrangebyscore(symbol_key, "-inf", current_price)
 ```
 
-**Results:**
-- Alert matching: ~8ms p99 latency
-- Memory: 85MB for 10K alerts (8.5KB per alert)
-- Throughput: 1000+ price updates/second
+**Results:** not benchmarked yet. The claim you can defend is the complexity.
 
 **Interview Talking Point:**
-"I chose Redis sorted sets over a naive O(n) scan because with 10K alerts, we'd be doing 10M comparisons/second. The sorted set gives us O(log n) lookups, bringing that down to ~13 comparisons. The trade-off is Redis network latency (~1ms) versus pure in-memory, but we gain persistence and horizontal scaling capabilities."
+"I chose Redis sorted sets over a naive O(n) scan: each trade does one range query, O(log n + k), where k is the number of alerts that actually fire, instead of checking every alert. The trade-off is a network round trip to Redis versus pure in-memory, but several instances can share alert state, and the atomic ZREM claim still prevents double-firing across processes."
 
 ---
 
@@ -76,10 +77,9 @@ Before:                After:
 - Delivery status tracking and metrics
 - HMAC signature for verification
 
-**Performance:**
-- Delivery latency: ~150ms p99
-- Success rate: >99% (with retries)
-- Max queue size: 10K webhooks
+**Limits:** the in-memory queue holds up to `MAX_WEBHOOK_QUEUE_SIZE` (10K)
+webhooks. Delivery latency is mostly the receiver's response time and isn't
+benchmarked.
 
 **Interview Talking Point:**
 "I implemented webhooks as a separate async queue to decouple delivery from the critical alert matching path. If a webhook endpoint is slow or down, it doesn't affect other users. The exponential backoff prevents thundering herd when services recover, and we track all attempts for debugging."
@@ -138,7 +138,7 @@ def match_price_update(symbol: str, price: float):
 **Choice:** Redis
 
 **Reasoning:**
-"Redis adds ~1ms latency but gives us persistence and the ability to scale horizontally by sharding by symbol. For production, the reliability and scaling benefits outweigh the small latency cost. We're still well under our <50ms p99 target."
+"Redis adds a network round trip per match, but gives us shared state across instances and the option to shard by symbol later. For this workload the scaling and correctness benefits outweigh that cost; the next step would be a Lua script to cut the round trips per fired alert from about 3 to 1."
 
 #### Decision 2: Async vs Sync Webhook Delivery
 
@@ -166,28 +166,14 @@ def match_price_update(symbol: str, price: float):
 
 ## Performance Benchmarks
 
-### Latency Distribution
+Not measured yet. The plan, so you can describe it if asked:
 
-| Operation | p50 | p99 | p999 | Target |
-|-----------|-----|-----|------|--------|
-| Alert Matching | 3ms | 8ms | 15ms | <50ms ✓ |
-| API Response | 15ms | 45ms | 80ms | <100ms ✓ |
-| Webhook Delivery | 85ms | 150ms | 280ms | <200ms ✓ |
-| Database Query | 5ms | 12ms | 25ms | <50ms ✓ |
-
-### Throughput
-
-- **Price Updates**: 1000+ updates/second
-- **Alert Triggers**: 10,000+ alerts/hour
-- **API Requests**: 500 req/sec per instance
-- **Daily Volume**: 200K+ alerts/day
-
-### Resource Usage
-
-- **CPU**: ~30% on 2 cores (under load)
-- **Memory**: 85MB per 10K alerts
-- **Network**: <1 Mbps per connection
-- **Database**: 500 connections @ 2% CPU
+- **Matching latency**: time `AlertMatcher.process_price_update` with 1K, 10K
+  and 100K armed alerts for one symbol; report p50/p99/p999.
+- **Throughput**: replay recorded Binance trades as fast as possible and count
+  sustained trades/second.
+- **Memory**: Redis `INFO memory` before and after loading N alerts.
+- **API**: `make test-load` (Locust) against one instance.
 
 ---
 
@@ -207,10 +193,8 @@ API-1   API-2   API-3   API-4  (Stateless)
   PostgreSQL (Metadata)
 ```
 
-**Scaling Limits:**
-- Single API instance: ~500 req/sec
-- Redis: ~100K ops/sec per node
-- PostgreSQL: ~10K writes/sec
+**Scaling Limits:** not measured. Today the app must run as one process
+(each would open its own exchange feeds and webhook queue).
 
 **Bottlenecks & Solutions:**
 1. **Redis becomes bottleneck** → Shard by symbol
@@ -309,7 +293,7 @@ async def connect(self) -> None:
 
 ### 3. Webhook Retry Logic
 **Challenge:** Simple retry caused thundering herd when services recovered.
-**Solution:** Exponential backoff + circuit breaker pattern.
+**Solution:** Exponential backoff with jitter (half fixed, half random), so retries spread out instead of arriving together.
 
 ---
 
@@ -320,13 +304,13 @@ async def connect(self) -> None:
 **Answer:**
 "Three bottlenecks to address:
 
-1. **Redis**: Shard by symbol. Hash symbol to determine Redis node. Each node handles ~100K alerts.
+1. **Redis**: Shard by symbol. Hash symbol to determine Redis node. (Measure per-node capacity first.)
 
 2. **WebSocket Connections**: Already multiplexed. Can scale to millions with current architecture.
 
 3. **Database**: Use read replicas for queries, async replication for writes. Move to time-series DB for webhook logs.
 
-Estimated cost: ~$500/month for 1M alerts at 10 exchanges."
+I'd benchmark one node before estimating cost."
 
 ### "What if Redis goes down?"
 
@@ -335,7 +319,7 @@ Estimated cost: ~$500/month for 1M alerts at 10 exchanges."
 
 1. **High Availability**: Redis Sentinel with automatic failover. 3-node cluster with replication. Recovery time: ~2 seconds.
 
-2. **Fallback Mode**: On Redis failure, load active alerts from PostgreSQL into in-memory sorted lists. Slower matching (~50ms vs 8ms) but keeps system running.
+2. **Fallback Mode**: On Redis failure, load active alerts from PostgreSQL into in-memory sorted lists. Slower matching, but the system keeps running.
 
 Trade-off: HA costs more but maintains SLA. Fallback is cheaper but degrades performance."
 
@@ -344,18 +328,20 @@ Trade-off: HA costs more but maintains SLA. Fallback is cheaper but degrades per
 **Answer:**
 "Multi-layer rate limiting:
 
-1. **Per-user limits**: 100 alerts per user, configurable.
-2. **API rate limiting**: 100 req/min via token bucket.
-3. **Webhook rate limiting**: Max 1000 deliveries/hour per endpoint.
-4. **Cost-based limiting**: Track webhook failures; disable endpoints with >90% failure rate.
-5. **Authentication**: 256-bit API keys stored as SHA-256 hashes (plaintext shown once, never stored); O(1) indexed lookup.
+1. **Per-user alert cap**: 100 active alerts per user, configurable.
+2. **API rate limiting**: 100 requests/min per user, fixed window in Redis so every instance shares the count. Invalid keys don't count against a user, so nobody can lock someone else out.
+3. **Sign-up limiting**: 5 registrations/hour per IP.
+4. **SSRF protection**: webhook URLs can't target private, loopback or metadata addresses; checked at connect time to beat DNS rebinding.
+5. **Authentication**: 256-bit API keys stored as SHA-256 hashes (plaintext shown once, never stored); O(1) indexed lookup; rotatable.
+
+Not built yet: per-endpoint webhook rate limits, and disabling endpoints that keep failing.
 
 For production, add usage-based pricing to naturally limit abuse."
 
 ### "What's your p99 latency and why does it matter?"
 
 **Answer:**
-"Our p99 is 8ms for alert matching, meaning 99% of price updates are processed in under 8ms. This matters for trading applications where milliseconds count.
+"I haven't benchmarked it yet, so I won't quote a number. Here's how I'd measure it: time the match step with 1K, 10K and 100K alerts loaded and report p50/p99/p999. p99 means 99% of price updates are processed within that time. It matters for trading applications where milliseconds count.
 
 I chose p99 over p50 because in finance, tail latency kills you. One slow alert that takes 200ms might miss a trading opportunity. By optimizing for p99, we ensure consistent performance even under load.
 
@@ -441,7 +427,7 @@ pytest tests/unit/test_matcher.py -v --benchmark
 
 ## Final Tips
 
-1. **Lead with impact**: "Handles 100K+ alerts/day with <50ms latency"
+1. **Lead with impact**: what it does and the hard problems you solved (double-firing, SSRF, the silently dying feed)
 2. **Show trade-offs**: Every decision has alternatives
 3. **Quantify everything**: Use numbers, not adjectives
 4. **Admit limitations**: "This doesn't handle X yet because Y"

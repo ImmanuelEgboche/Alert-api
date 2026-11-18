@@ -1,7 +1,7 @@
 """Account endpoints: per-user webhook secrets and key rotation."""
 import hashlib
 import hmac
-import json
+import re
 from datetime import datetime, timezone
 
 import httpx
@@ -66,9 +66,25 @@ async def test_rotation_requires_auth(client: AsyncClient):
         assert r.status_code == 401
 
 
+# The receiver-side check documented in README.md and docs/API.md
+SIGNATURE_FIELD = re.compile(rb',"signature":"([0-9a-f]{64})"}$')
+
+
+def verify_webhook(body: bytes, secret: str) -> bool:
+    match = SIGNATURE_FIELD.search(body)
+    if not match:
+        return False
+    signed = body[: match.start()] + b"}"
+    expected = hmac.new(secret.encode(), signed, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, match.group(1).decode())
+
+
 async def test_webhook_verifies_with_the_owners_secret(monkeypatch):
     """The point of the change: a user can verify signatures with the secret
-    they were given, and another user's secret doesn't verify them."""
+    they were given, and another user's secret doesn't verify them.
+
+    Uses a SHIB-sized price: re-serialising the JSON (the old documented
+    method) writes 1.234e-05 instead of 0.00001234 and breaks the HMAC."""
     secrets_by_user = {1: "whsec_alice", 2: "whsec_bob"}
     received: list[httpx.Request] = []
 
@@ -85,25 +101,19 @@ async def test_webhook_verifies_with_the_owners_secret(monkeypatch):
         transport=httpx.MockTransport(lambda r: received.append(r) or httpx.Response(200))
     )
     await wd._deliver_webhook({
-        "alert_id": 7, "retry_count": 0, "current_price": 51000.0,
+        "alert_id": 7, "retry_count": 0, "current_price": 0.00001201,
         "timestamp": datetime.now(timezone.utc),
-        "alert_data": {"id": "7", "user_id": "1", "symbol": "BTCUSDT", "condition": "price_above",
-                       "threshold": "50000", "webhook_url": "https://hooks.example.com/"},
+        "alert_data": {"id": "7", "user_id": "1", "symbol": "SHIBUSDT", "condition": "price_below",
+                       "threshold": "0.00001234", "webhook_url": "https://hooks.example.com/"},
     })
     await wd.client.aclose()
 
-    # Verify exactly as the README tells users to
     body = received[0].content
-    data = json.loads(body)
-    claimed = data.pop("signature")
-    canonical = json.dumps(data, separators=(",", ":"))
-
-    def sign(secret: str) -> str:
-        return hmac.new(secret.encode(), canonical.encode(), hashlib.sha256).hexdigest()
-
-    assert hmac.compare_digest(claimed, sign("whsec_alice"))
+    assert b"0.00001201" in body  # small prices stay in plain notation
+    assert verify_webhook(body, "whsec_alice")
+    assert not verify_webhook(body, "whsec_bob")
+    claimed = SIGNATURE_FIELD.search(body).group(1).decode()
     assert received[0].headers["X-Webhook-Signature"] == claimed
-    assert not hmac.compare_digest(claimed, sign("whsec_bob"))
 
 
 async def test_disabled_users_webhooks_are_not_sent(monkeypatch):

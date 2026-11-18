@@ -25,12 +25,13 @@ curl -H "X-API-Key: abc123..." http://localhost:8000/api/v1/alerts
 
 ## Rate Limits
 
-- **Authenticated requests**: 100 requests/minute
-- **Burst**: 20 additional requests
-- **Response headers**:
-  - `X-RateLimit-Limit`: Rate limit window
-  - `X-RateLimit-Remaining`: Requests remaining
-  - `X-RateLimit-Reset`: Reset timestamp
+- **Authenticated requests**: 100 requests/minute per user, across all
+  endpoints (`RATE_LIMIT_PER_MINUTE`). Requests with an invalid key don't count.
+- **Registration**: 5 per hour per client IP (`REGISTER_RATE_LIMIT_PER_HOUR`).
+- Over the limit: `429 Too Many Requests` with headers
+  - `Retry-After`: seconds until the window resets
+  - `X-RateLimit-Limit`: the limit that was hit
+  - `X-RateLimit-Remaining`: `0`
 
 ## Endpoints
 
@@ -38,7 +39,8 @@ curl -H "X-API-Key: abc123..." http://localhost:8000/api/v1/alerts
 
 #### Register User
 
-Create new user account and receive API key.
+Create new user account. The response is the **only** time the API key and
+webhook secret are shown; store both.
 
 **Request:**
 ```http
@@ -55,15 +57,50 @@ Content-Type: application/json
 {
   "id": 1,
   "email": "user@example.com",
-  "api_key": "9a7b8c6d5e4f3a2b1c9d8e7f6a5b4c3d2e1f9a8b7c6d5e4f3a2b1c9d8e7f6a5b",
+  "api_key_prefix": "cak_9a7b8c6d",
   "is_active": true,
-  "created_at": "2024-01-15T12:00:00Z"
+  "created_at": "2024-01-15T12:00:00Z",
+  "api_key": "cak_9a7b8c6d5e4f3a2b1c9d8e7f6a5b4c3d2e1f9a8b7c6d5e4f3a2b1c9d8e7f6a5b",
+  "webhook_secret": "whsec_3f2a..."
 }
 ```
 
 **Errors:**
 - `400`: Email already registered
 - `422`: Invalid email format
+- `429`: Too many registrations from this IP
+
+#### Get Account
+
+```http
+GET /api/v1/me
+X-API-Key: cak_...
+```
+
+Returns `id`, `email`, `api_key_prefix`, `is_active`, `created_at`. Never
+includes the API key or webhook secret.
+
+#### Rotate API Key
+
+```http
+POST /api/v1/me/api-key
+X-API-Key: cak_...
+```
+
+**Response (200):** `{"api_key": "cak_...", "api_key_prefix": "cak_..."}`.
+The key used for this request stops working immediately. A lost key with no
+copy can't be recovered.
+
+#### Rotate Webhook Secret
+
+```http
+POST /api/v1/me/webhook-secret
+X-API-Key: cak_...
+```
+
+**Response (200):** `{"webhook_secret": "whsec_..."}`. Every delivery from now
+on, including retries of earlier alerts, is signed with the new secret.
+Accounts created before v1.1 must call this once to learn their secret.
 
 ---
 
@@ -96,7 +133,7 @@ Content-Type: application/json
 | symbol | string | Yes | Binance trading pair, e.g. `BTCUSDT` (case-insensitive; must currently trade on Binance) |
 | condition | string | Yes | Alert condition: `price_above`, `price_below` |
 | threshold | float | Yes | Price threshold (must be > 0) |
-| webhook_url | string (URL) | Yes | HTTPS webhook endpoint |
+| webhook_url | string (URL) | Yes | Public http(s) endpoint. Private, loopback, link-local and metadata addresses, `localhost`, `.internal`/`.local` and single-label hosts are rejected (`422`) |
 | is_recurring | boolean | No | Whether alert recurs (default: false) |
 | expires_at | datetime | No | Optional expiration time |
 
@@ -401,47 +438,50 @@ When an alert triggers, a POST request is sent to your webhook URL.
 
 ### Webhook Signature Verification
 
-Verify webhook authenticity using HMAC-SHA256:
+Each webhook is signed with HMAC-SHA256 using **your** `webhook_secret` (from
+registration, or `POST /api/v1/me/webhook-secret`). The same signature is in
+the body's `signature` field and the `X-Webhook-Signature` header.
+
+The signed bytes are the exact request body with its final `"signature"` field
+removed. Verify against the **raw body**: parsing and re-serialising the JSON
+can change how numbers are written (`0.00001234` → `1.234e-05`) and make valid
+webhooks fail.
 
 **Python:**
 ```python
-import hmac
 import hashlib
+import hmac
+import re
 
-def verify_webhook(payload: str, signature: str, secret: str) -> bool:
-    expected = hmac.new(
-        secret.encode(),
-        payload.encode(),
-        hashlib.sha256
-    ).hexdigest()
-    return hmac.compare_digest(expected, signature)
+SIGNATURE_FIELD = re.compile(rb',"signature":"([0-9a-f]{64})"}$')
 
-# Usage
+def verify_webhook(body: bytes, secret: str) -> bool:
+    match = SIGNATURE_FIELD.search(body)
+    if not match:
+        return False
+    signed = body[: match.start()] + b"}"
+    expected = hmac.new(secret.encode(), signed, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, match.group(1).decode())
+
+# Usage (FastAPI)
 @app.post("/webhook")
 async def handle_webhook(request: Request):
-    body = await request.body()
-    signature = request.headers.get("X-Webhook-Signature")
-
-    if not verify_webhook(body.decode(), signature, SECRET_KEY):
+    if not verify_webhook(await request.body(), WEBHOOK_SECRET):
         raise HTTPException(status_code=401, detail="Invalid signature")
-
     # Process webhook...
 ```
 
-**Node.js:**
+**Node.js** (use the raw body, e.g. `express.raw({ type: 'application/json' })`):
 ```javascript
 const crypto = require('crypto');
 
-function verifyWebhook(payload, signature, secret) {
-  const expected = crypto
-    .createHmac('sha256', secret)
-    .update(payload)
-    .digest('hex');
-
-  return crypto.timingSafeEqual(
-    Buffer.from(signature),
-    Buffer.from(expected)
-  );
+function verifyWebhook(rawBody, secret) {
+  const body = rawBody.toString('utf8');
+  const match = body.match(/,"signature":"([0-9a-f]{64})"}$/);
+  if (!match) return false;
+  const signed = body.slice(0, match.index) + '}';
+  const expected = crypto.createHmac('sha256', secret).update(signed).digest('hex');
+  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(match[1]));
 }
 ```
 
@@ -451,7 +491,9 @@ function verifyWebhook(payload, signature, secret) {
 - **Backoff**: Exponential (2s, 4s, 8s)
 - **Timeout**: 5 seconds per attempt
 - **Success**: HTTP 2xx response
-- **Failure**: Added to dead letter queue after max retries
+- **Failure**: recorded as `failed` in the alert's logs after max retries
+- **Never retried**: most 4xx responses, and URLs that resolve to a non-public
+  address (logged as `Blocked: ...`). Redirects are not followed.
 
 ### Webhook Best Practices
 

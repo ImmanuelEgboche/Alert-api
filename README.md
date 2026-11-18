@@ -17,14 +17,16 @@ their own exchange WebSocket connections.
 
 ### Project status
 
-**Ready to self-host; not yet safe to open to other users.** The full pipeline
-(live Binance trade → match → signed webhook) has been tested against the real
+**Safe for other users; not yet hosted publicly.** The full pipeline (live
+Binance trade → match → signed webhook) has been tested against the real
 Binance feed, and there's a [production Compose setup](#run-in-production).
-121 tests pass with 80% coverage.
+Webhook URLs can't reach internal addresses, each user verifies webhooks with
+their own secret, and requests are rate limited. CI runs lint and the full
+test suite on every push.
 
-Before letting anyone else use it, read [Known limitations](#-known-limitations):
-SSRF and missing rate limiting are the blockers. The full list of changes and
-remaining work is in [CHANGELOG.md](CHANGELOG.md).
+What's left is in [Known limitations](#-known-limitations): mainly HTTPS
+hosting and durability across restarts. The full list of changes is in
+[CHANGELOG.md](CHANGELOG.md).
 
 ### Features
 
@@ -44,7 +46,12 @@ remaining work is in [CHANGELOG.md](CHANGELOG.md).
 - **Alert expiry**: optional `expires_at`, checked at fire time and cleaned up
   by a background sweep.
 - **Secure API keys**: 256-bit keys stored only as SHA-256 hashes and shown once
-  at registration; lookup is a single indexed query.
+  at registration; lookup is a single indexed query; rotatable.
+- **Safe for multiple users**: webhook URLs can't target private, loopback or
+  cloud-metadata addresses (checked when each connection opens, so DNS
+  rebinding doesn't get around it); each user verifies webhooks with their own
+  webhook secret; per-user and per-IP rate limits.
+- **Schema migrations**: Alembic, applied automatically on startup.
 - **Monitoring**: a readiness check (`/health` returns 503 when the database,
   Redis or a price feed is down), HTTP request metrics for Prometheus,
   structured JSON logs, and an operator-only stats endpoint.
@@ -115,13 +122,10 @@ docker compose up -d --build
 docker logs crypto-alert-api --tail 5    # look for "application_started"
 ```
 
-Tables are created on startup. If you're upgrading a database created before
-the API-key change, run the migration once:
-
-```bash
-docker exec -i crypto-alert-postgres psql -U postgres -d cryptoalert \
-  < scripts/migrations/001_hash_api_keys.sql
-```
+Database migrations run automatically on startup (or `make migrate`). A
+database created by v1.0.0 is detected and adopted with no manual step. One
+exception: a database from before the API-key change must first run
+`scripts/migrations/001_hash_api_keys.sql`, and the app says so if needed.
 
 ### Run in production
 
@@ -145,7 +149,9 @@ curl -i http://localhost:8000/api/v1/health    # 200 = ready, 503 = something's 
 The app **refuses to start** in production with a placeholder or short
 `SECRET_KEY`, or with `DEBUG=true`, and the logs say why. It uses its own
 project name, so its containers and volumes never mix with the dev stack's.
-Put HTTPS in front of it (e.g. Caddy or nginx) before exposing it.
+Put HTTPS in front of it (e.g. Caddy or nginx) before exposing it. Behind a
+proxy, set `FORWARDED_ALLOW_IPS` to the proxy's address so per-IP rate limits
+see real client IPs instead of the proxy's.
 
 Run exactly one API process: each one opens its own exchange feed and webhook
 queue.
@@ -166,12 +172,13 @@ venv for `make dev`, `make test` or `make lint`.
 ### Using the API
 
 ```bash
-# 1. Register. The api_key is shown ONCE; store it now.
+# 1. Register. The api_key and webhook_secret are shown ONCE; store them now.
 curl -X POST http://localhost:8000/api/v1/register \
   -H "Content-Type: application/json" \
   -d '{"email": "you@example.com"}'
 # {"id": 1, "email": "you@example.com", "api_key_prefix": "cak_1a2b3c4d",
-#  "is_active": true, "created_at": "...", "api_key": "cak_1a2b3c4d..."}
+#  "is_active": true, "created_at": "...", "api_key": "cak_1a2b3c4d...",
+#  "webhook_secret": "whsec_..."}
 
 # 2. Create an alert
 curl -X POST http://localhost:8000/api/v1/alerts \
@@ -202,7 +209,10 @@ details.
 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
-| POST | `/api/v1/register` | none | Register; returns the API key once |
+| POST | `/api/v1/register` | none | Register; returns the API key and webhook secret once |
+| GET | `/api/v1/me` | API key | Your account (no secrets) |
+| POST | `/api/v1/me/api-key` | API key | Rotate API key; the old key stops working at once |
+| POST | `/api/v1/me/webhook-secret` | API key | Rotate webhook signing secret |
 | POST | `/api/v1/alerts` | API key | Create alert |
 | GET | `/api/v1/alerts` | API key | List alerts (`status`, `symbol`, `limit`, `offset`) |
 | GET | `/api/v1/alerts/{id}` | API key | Get alert |
@@ -211,6 +221,16 @@ details.
 | GET | `/api/v1/alerts/{id}/logs` | API key | Webhook delivery attempts |
 | GET | `/api/v1/health` | none | Readiness: DB, Redis and exchange feeds. 200 if ready, 503 if not |
 | GET | `/api/v1/metrics` | operator token | Platform-wide stats ([below](#operator-stats)) |
+
+**Rate limits:** 100 requests/minute per user across all authenticated
+endpoints (`RATE_LIMIT_PER_MINUTE`), and 5 registrations/hour per IP
+(`REGISTER_RATE_LIMIT_PER_HOUR`). Over the limit you get `429` with a
+`Retry-After` header.
+
+**Webhook URLs** must be public `http`/`https` addresses. Private, loopback,
+link-local and cloud-metadata addresses, `localhost`, `.internal`/`.local`
+names and single-label hosts are rejected with `422`. Redirects are not
+followed.
 
 ### Alert conditions
 
@@ -254,23 +274,28 @@ The same signature is also sent in the `X-Webhook-Signature` header.
 `408`, `425` and `429` are retried up to `WEBHOOK_MAX_RETRIES` times with
 backoff (about 2s, 4s, 8s by default). Any other `4xx` fails immediately.
 
-**Verifying the signature.** The signature is an HMAC-SHA256 of the body
-without the `signature` field, serialised compactly:
+**Verifying the signature.** `secret` is the `webhook_secret` you got at
+registration (rotate it with `POST /api/v1/me/webhook-secret`). The signature
+is an HMAC-SHA256 of the exact body with its final `"signature"` field
+removed. Work on the **raw bytes**: parsing and re-serialising the JSON can
+change how numbers are written (`0.00001234` becomes `1.234e-05`) and break
+the check.
 
 ```python
-import hashlib, hmac, json
+import hashlib, hmac, re
+
+SIGNATURE_FIELD = re.compile(rb',"signature":"([0-9a-f]{64})"}$')
 
 def verify_webhook(body: bytes, secret: str) -> bool:
-    data = json.loads(body)
-    claimed = data.pop("signature")
-    canonical = json.dumps(data, separators=(",", ":"))
-    expected = hmac.new(secret.encode(), canonical.encode(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, claimed)
+    match = SIGNATURE_FIELD.search(body)
+    if not match:
+        return False
+    signed = body[: match.start()] + b"}"
+    expected = hmac.new(secret.encode(), signed, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, match.group(1).decode())
 ```
 
-> ⚠️ `secret` is currently the **server's** `SECRET_KEY`. That's fine when you
-> run the server yourself. A multi-user deployment needs a separate secret per
-> user; see [Known limitations](#-known-limitations).
+Node.js and more examples are in [docs/API.md](docs/API.md#webhook-signature-verification).
 
 ### Operator stats
 
@@ -322,7 +347,10 @@ make test-load
 
 What's covered: alert matching and the re-arm logic, concurrent double-fire
 protection, the webhook worker pool, retry policy and backoff, API-key storage
-and auth, expiry (unit and Postgres), metrics auth and the exporter,
+and auth, SSRF blocking (including DNS rebinding), per-user webhook signatures
+and key/secret rotation, rate limits, migrations (they must match the models,
+and v1.0.0 databases must be adopted), expiry (unit and Postgres), metrics
+auth and the exporter,
 subscription restore on restart, exchange reconnects (against a real local
 WebSocket server), alert input validation (symbols, conditions, status
 changes, deleted alerts), health checks, and production settings validation.
@@ -334,7 +362,7 @@ their `.env.example` values:
 
 | Variable | Value | Purpose |
 |---|---|---|
-| `SECRET_KEY` | placeholder | Signs webhooks. Production requires ≥ 32 chars and not the placeholder |
+| `SECRET_KEY` | placeholder | Server secret (webhooks use per-user secrets). Production requires ≥ 32 chars and not the placeholder |
 | `METRICS_TOKEN` | unset | Operator token for `/api/v1/metrics`; unset = endpoint disabled |
 | `ENVIRONMENT` | `development` | `production` enforces safe settings at startup |
 | `DEBUG` | `true` | Enables `/docs`. Also echoes all SQL and shows error details; refused in production |
@@ -347,20 +375,18 @@ their `.env.example` values:
 | `WEBHOOK_WORKERS` | 10 | Concurrent webhook deliveries |
 | `WEBHOOK_MAX_RETRIES` | 3 | Retries per webhook |
 | `WEBHOOK_RETRY_DELAY_SECONDS` | 2 | Base backoff (doubles each retry) |
-
-`RATE_LIMIT_*` settings exist but are **not enforced yet**.
+| `RATE_LIMIT_PER_MINUTE` | 100 | Requests per minute per user |
+| `REGISTER_RATE_LIMIT_PER_HOUR` | 5 | Registrations per hour per client IP |
+| `WEBHOOK_ALLOW_PRIVATE_URLS` | false | Allow webhooks to localhost/private networks. **Local testing only**; refused in production |
+| `FORWARDED_ALLOW_IPS` | unset | Read by uvicorn: proxies trusted for `X-Forwarded-For`. Set it when behind a reverse proxy |
 
 ## ⚠️ Known limitations
 
 These come from an end-to-end test against the live container. Full list with
 details: [CHANGELOG.md → To do](CHANGELOG.md#to-do).
 
-**Must fix before letting other people use it:**
-- **SSRF:** webhook URLs aren't restricted, so the server will POST to internal
-  addresses (e.g. cloud metadata at `169.254.169.254`).
-- Webhooks are signed with the shared server secret; per-user secrets are needed.
-- No rate limiting, no API key rotation, and no Alembic migrations.
-- No CI yet, and HTTPS is up to you (put a reverse proxy in front).
+**Hosting:** not deployed publicly yet. HTTPS is up to you: put a reverse
+proxy in front (and set `FORWARDED_ALLOW_IPS`).
 
 **Reliability:** keepalive pings catch a dead connection, but not a feed that
 stays connected while trades stop arriving. A watchdog for that is planned.
@@ -403,7 +429,21 @@ in memory and lost on restart. Performance has not been benchmarked yet.
 - "Expiry is enforced in two layers: a fire-time check guarantees correctness,
   and a sweep handles housekeeping."
 
-### 4. Observability
+### 4. Security
+- "Users choose where the server sends POST requests, which is an SSRF risk.
+  I verified the server would hit the cloud metadata IP, then blocked
+  non-public addresses inside the HTTP client's connect step. Checking at
+  connect time means the address checked is the address used, so DNS
+  rebinding doesn't work, and TLS still verifies the real hostname."
+- "My first version swapped the hostname for the vetted IP in the URL. A live
+  test showed connection pooling then reused a TLS connection verified for one
+  hostname to send requests for another on the same IP, so I moved the check
+  into the network layer instead."
+- "Webhooks were signed with a server secret users couldn't have. Each user
+  now has their own, read at every delivery attempt so rotation applies to
+  pending retries."
+
+### 5. Observability
 - "Prometheus labels use route templates, not raw paths, to keep label
   cardinality bounded."
 - "Operator stats require a separate bearer token, because platform-wide data
@@ -416,7 +456,7 @@ in memory and lost on restart. Performance has not been benchmarked yet.
   mode at startup, rather than running insecurely and logging a warning
   nobody reads."
 
-### 5. Trade-offs and what's next
+### 6. Trade-offs and what's next
 - "Redis vs in-process memory: Redis lets several instances share alert state,
   and the atomic claim still holds across processes. The cost is a network
   round trip; a Lua script could combine match and claim into one call."

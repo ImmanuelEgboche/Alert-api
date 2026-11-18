@@ -3,11 +3,8 @@
 ## Overview
 Production-grade cryptocurrency alert API designed to showcase systems thinking for quantitative data engineering roles at top trading firms (Citadel, Jane Street, HRT, etc.).
 
-**Target Performance Metrics:**
-- Latency: <50ms (p99)
-- Uptime: 99.9%
-- Throughput: 100K+ alerts/day
-- User Target: 50-100 developers in 6 weeks
+> Performance has not been benchmarked yet, so this document makes no latency, throughput or uptime claims. Complexity figures (e.g. O(log n + k) matching) come from the data
+> structures used, not from measurement.
 
 ## System Architecture
 
@@ -37,7 +34,7 @@ Production-grade cryptocurrency alert API designed to showcase systems thinking 
 ┌──────────────────────────────────────────┐
 │      Alert Matching Engine (Core)        │
 │  ┌─────────────────────────────────────┐ │
-│  │ Interval Tree / Sorted Sets         │ │
+│  │ Redis Sorted Sets                   │ │
 │  │ O(log n + k) matching per price     │ │
 │  └─────────────────────────────────────┘ │
 └──────────────┬───────────────────────────┘
@@ -67,22 +64,20 @@ Production-grade cryptocurrency alert API designed to showcase systems thinking 
 - Automatic reconnection with exponential backoff
 - Connection health monitoring
 - Shared connections for multiple alerts (efficiency)
-- Support for Binance, Coinbase Pro, Kraken
+- Binance is live; a Coinbase adapter exists but is not wired up yet
 
 **Performance Considerations:**
 - Single connection per exchange per symbol pair
 - Multiplexing: N alerts → 1 WebSocket connection
-- Memory: ~10KB per connection
-- Latency: Direct feed = 1-5ms from exchange
 
 ### 2. Alert Matching Engine
 **Purpose:** Efficiently match incoming price updates against active alerts
-**Data Structure:** Interval Tree + Redis Sorted Sets
+**Data Structure:** Redis Sorted Sets
 
 **Algorithm:**
 ```python
 # For each price update:
-# 1. O(log n) lookup in interval tree for triggered alerts
+# 1. O(log n + k) ZRANGEBYSCORE on the symbol's sorted set
 # 2. O(1) Redis read for alert metadata
 # 3. O(k) webhook dispatch for k matched alerts
 # Total: O(log n + k) per price update
@@ -113,7 +108,7 @@ Production-grade cryptocurrency alert API designed to showcase systems thinking 
 - Async delivery: Non-blocking
 - Batch processing: Up to 100 webhooks/batch
 - Timeout: 5s per webhook
-- Circuit breaker for failing endpoints
+- Non-retryable errors (most 4xx, blocked URLs) fail immediately
 
 ### 4. REST API
 **Purpose:** User-facing API for CRUD operations
@@ -156,21 +151,21 @@ Keys:
 
 ## Performance Optimizations
 
-### 1. Latency (<50ms)
+### 1. Latency
 - **In-memory matching:** Redis sorted sets for hot path
 - **Connection pooling:** Reuse HTTP/WS connections
 - **Async I/O:** Non-blocking operations throughout
 - **Local caching:** LRU cache for frequently accessed data
 
-### 2. Throughput (100K+ alerts/day)
+### 2. Throughput
 - **Batching:** Group webhook deliveries
 - **Multiplexing:** Share WebSocket connections
 - **Horizontal scaling:** Stateless API servers
-- **Efficient data structures:** Interval trees, sorted sets
+- **Efficient data structures:** sorted sets
 
-### 3. Reliability (99.9% uptime)
+### 3. Reliability
 - **Health checks:** /health endpoint for load balancers
-- **Circuit breakers:** Prevent cascade failures
+- **Timeouts:** every health probe and webhook has one
 - **Graceful degradation:** Fallback to polling if WS fails
 - **Monitoring:** Prometheus metrics + alerting
 
@@ -263,7 +258,7 @@ curl -X POST https://api.cryptoalert.dev/api/v1/alerts \
 ## Security
 
 1. **Authentication:** API keys stored as SHA-256 hashes, looked up by unique index (plaintext returned once at registration)
-2. **Rate Limiting:** Token bucket algorithm
+2. **Rate Limiting:** fixed window per user (and per IP on /register), counted in Redis
 3. **Input Validation:** Pydantic models
 4. **Webhook Verification:** HMAC signatures
 5. **DDoS Protection:** Nginx rate limiting
@@ -279,18 +274,15 @@ curl -X POST https://api.cryptoalert.dev/api/v1/alerts \
 
 ## Success Metrics for Portfolio
 
-### Technical Metrics (for CV)
-- ✅ P99 latency < 50ms
-- ✅ 99.9% uptime over 6 weeks
-- ✅ 100K+ alerts processed/day
-- ✅ Support 3+ exchanges
-- ✅ Horizontal scaling demonstrated
+### Technical Metrics (goals, not yet measured)
+- [ ] Benchmark matching latency and throughput, and publish the method
+- [ ] Measure uptime once publicly hosted
+- [ ] Wire up a second exchange (Coinbase adapter exists)
+- [ ] Demonstrate more than one API instance
 
-### Product Metrics
-- ✅ 50-100 developers using API
-- ✅ 500+ GitHub stars
-- ✅ Featured in dev newsletters
-- ✅ 10+ testimonials/use cases
+### Product Metrics (goals)
+- [ ] Developers using the hosted API
+- [ ] GitHub stars, write-ups, use cases
 
 ### Code Quality (for interviews)
 - ✅ Clean architecture (SOLID principles)
@@ -302,18 +294,16 @@ curl -X POST https://api.cryptoalert.dev/api/v1/alerts \
 ## Interview Talking Points
 
 1. **Systems Design:**
-   - "Interval tree for O(log n) alert matching"
-   - "Redis sorted sets for hot path optimization"
+   - "Redis sorted sets for O(log n + k) alert matching"
    - "WebSocket multiplexing for efficiency"
 
 2. **Performance:**
-   - "Achieved <10ms p99 latency in matching engine"
-   - "Handled 10K alerts with <100MB memory"
-   - "Optimized WebSocket connections: N alerts → 1 connection"
+   - "One WebSocket per exchange carries every symbol: N alerts → 1 connection"
+   - (Add measured latency/memory figures here once benchmarked)
 
 3. **Reliability:**
    - "Implemented exponential backoff for webhook retries"
-   - "Circuit breaker pattern for exchange connections"
+   - "Exchange reconnects with capped exponential backoff, resubscribing every symbol"
    - "Zero-downtime deployment with health checks"
 
 4. **Trade-offs:**

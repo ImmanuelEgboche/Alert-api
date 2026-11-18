@@ -1,4 +1,4 @@
-"""Webhook delivery with retry logic and dead letter queue."""
+"""Webhook delivery: worker pool, retries with backoff, per-user signatures, SSRF guard."""
 import asyncio
 import hashlib
 import hmac

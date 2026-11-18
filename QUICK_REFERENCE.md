@@ -24,11 +24,8 @@ open http://localhost:8000/docs
 
 | Metric | Value | Proof Location |
 |--------|-------|----------------|
-| **P99 Latency** | 8ms | `tests/unit/test_matcher.py` |
-| **Throughput** | 100K+ alerts/day | `ARCHITECTURE.md` |
 | **Lines of Code** | 2,500+ | `wc -l src/**/*.py` |
 | **Test Coverage** | 80%+ | `pytest --cov=src` |
-| **Uptime Design** | 99.9% | `docker-compose.yml` (HA setup) |
 | **Algorithm** | O(log n + k) | `src/core/matcher.py:67` |
 
 ---
@@ -82,16 +79,16 @@ async def match_price_update(symbol, price):
 ## 💡 Key Interview Talking Points
 
 ### 1. Performance
-"Achieved 8ms p99 latency using Redis sorted sets for O(log n) matching instead of O(n) linear scan."
+"Redis sorted sets make matching O(log n + k) per trade instead of an O(n) scan of every alert." (Latency not benchmarked yet; don't quote a number.)
 
 ### 2. Efficiency
-"WebSocket multiplexing reduced connections by 1000x. One connection serves N users, saving ~10MB per 1000 alerts."
+"One WebSocket per exchange carries every subscribed symbol, so N alerts share one connection instead of opening one each."
 
 ### 3. Reliability
 "Implemented exponential backoff for retries to prevent thundering herd when services recover."
 
 ### 4. Trade-offs
-"Chose Redis over pure in-memory for persistence and horizontal scaling, accepting +1ms latency."
+"Chose Redis over pure in-memory so several instances can share alert state, accepting a network round trip per match."
 
 ---
 
@@ -198,7 +195,6 @@ pytest --cov=src --cov-report=term
 
 ### Data Structures
 - Redis sorted sets
-- Interval trees
 - Hash maps
 - Priority queues
 
@@ -258,7 +254,7 @@ This project showcases skills for:
 
 vs. Typical Portfolio Projects:
 1. ✅ **Production-grade** (not a toy project)
-2. ✅ **Measurable metrics** (8ms, 100K/day, not "fast")
+2. ✅ **Honest metrics** (complexity from the design; latency to be benchmarked)
 3. ✅ **Real problem** (actual developer need)
 4. ✅ **Complete docs** (200+ pages)
 5. ✅ **Scalability** (horizontal scaling strategy)
@@ -286,7 +282,7 @@ make setup && make dev
 
 ## ⚡ One-Liner Summary
 
-> "Production-grade crypto alert API processing 100K+ alerts/day with <10ms latency using O(log n) Redis sorted sets, WebSocket multiplexing, and async webhooks—built to demonstrate systems thinking for quant trading firms."
+> "Crypto alert API that matches live Binance trades against alerts in O(log n + k) with Redis sorted sets, multiplexes every symbol over one WebSocket, and delivers signed webhooks with retries, hardened against SSRF and abuse."
 
 ---
 
