@@ -83,9 +83,11 @@ class Settings(BaseSettings):
     secret_key: str = Field(default="change-me-in-production")
     api_key_length: int = 32
 
-    # Rate Limiting
-    rate_limit_per_minute: int = 100
-    rate_limit_burst: int = 20
+    # Rate Limiting (enforced in src/api/rate_limit.py, shared via Redis)
+    # Requests per minute per user, across all authenticated endpoints
+    rate_limit_per_minute: int = Field(default=100, ge=1)
+    # New accounts per hour per client IP
+    register_rate_limit_per_hour: int = Field(default=5, ge=1)
 
     # Webhooks
     webhook_timeout_seconds: int = 5

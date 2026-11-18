@@ -19,6 +19,7 @@ from src.database import get_db
 from src.models import Base
 from src.config import get_settings
 from src.api import dependencies as deps
+from src.api import rate_limit
 from src.exchanges.symbols import SymbolRegistry
 
 settings = get_settings()
@@ -95,7 +96,18 @@ async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
     registry = SymbolRegistry(symbols=TEST_SYMBOLS)
     app.dependency_overrides[deps.get_symbol_registry] = lambda: registry
 
+    await clear_rate_limits()
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         yield ac
 
     app.dependency_overrides.clear()
+    await clear_rate_limits()
+
+
+async def clear_rate_limits() -> None:
+    """Rate-limit counters live in Redis for up to an hour; without this, one
+    test's requests would count against the next (user ids restart at 1)."""
+    redis = await database.get_redis()
+    keys = [k async for k in redis.scan_iter(match=f"{rate_limit.KEY_PREFIX}*")]
+    if keys:
+        await redis.delete(*keys)

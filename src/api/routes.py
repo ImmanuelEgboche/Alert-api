@@ -33,6 +33,7 @@ from src.api.auth import (
     require_metrics_token,
 )
 from src.config import get_settings
+from src.api.rate_limit import limit_registrations
 from src.api.dependencies import get_alert_matcher, get_connection_manager, get_symbol_registry
 from src.core.matcher import AlertMatcher
 from src.core.connection_manager import ConnectionManager
@@ -73,7 +74,12 @@ async def _check_alert_limit(matcher: AlertMatcher, user_id: int) -> None:
         )
 
 
-@router.post("/register", response_model=UserCreatedResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/register",
+    response_model=UserCreatedResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(limit_registrations)],
+)
 async def register_user(
     user_data: UserCreate,
     session: AsyncSession = Depends(get_db),

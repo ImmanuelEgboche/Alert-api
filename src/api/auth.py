@@ -20,6 +20,7 @@ from sqlalchemy import select
 from src.config import get_settings
 from src.database import get_db
 from src.models import User
+from src.api.rate_limit import limit_user
 
 # Recognisable prefix: lets secret scanners and humans spot leaked keys.
 API_KEY_PREFIX = "cak_"
@@ -78,6 +79,7 @@ async def get_current_user(
             detail="User account is disabled",
         )
 
+    await limit_user(user.id)
     return user
 
 
