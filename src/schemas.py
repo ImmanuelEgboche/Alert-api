@@ -66,6 +66,22 @@ class UserCreatedResponse(UserResponse):
     """Registration response - the ONLY time the full API key is ever returned."""
 
     api_key: str = Field(..., description="Store this now; it cannot be retrieved again")
+    webhook_secret: str = Field(
+        ..., description="Verifies webhook signatures. Store it now; rotate to get a new one"
+    )
+
+
+class ApiKeyRotatedResponse(BaseModel):
+    """New API key. The previous key stopped working when this was issued."""
+
+    api_key: str = Field(..., description="Store this now; it cannot be retrieved again")
+    api_key_prefix: str
+
+
+class WebhookSecretRotatedResponse(BaseModel):
+    """New webhook signing secret, used for every delivery from now on."""
+
+    webhook_secret: str = Field(..., description="Store this now; it cannot be retrieved again")
 
 
 class AlertCreate(BaseModel):

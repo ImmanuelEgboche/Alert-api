@@ -132,11 +132,16 @@ async def test_blocked_delivery_is_not_sent_or_retried(monkeypatch):
         logs.append((status, kw.get("error_message")))
 
     monkeypatch.setattr(WebhookDelivery, "_log_delivery", fake_log)
+
+    async def fake_secret(self, user_id):
+        return "whsec_test"
+
+    monkeypatch.setattr(WebhookDelivery, "_get_signing_secret", fake_secret)
     wd = WebhookDelivery()
     wd.client = httpx.AsyncClient(transport=create_safe_transport(httpx.Limits()))
     await wd._deliver_webhook({
         "alert_id": 1, "retry_count": 0, "current_price": 1.0, "timestamp": datetime.now(),
-        "alert_data": {"id": "1", "symbol": "BTCUSDT", "condition": "price_above",
+        "alert_data": {"id": "1", "user_id": "1", "symbol": "BTCUSDT", "condition": "price_above",
                        "threshold": "1", "webhook_url": "https://evil.example.com/"},
     })
     assert connects == []

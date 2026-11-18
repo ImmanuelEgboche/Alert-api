@@ -13,7 +13,9 @@ import httpx
 
 from src.config import get_settings
 from src.database import AsyncSessionLocal
-from src.models import WebhookLog, WebhookStatus
+from sqlalchemy import select
+
+from src.models import User, WebhookLog, WebhookStatus
 from src.schemas import WebhookPayload
 from src.webhooks.url_safety import UnsafeWebhookURL, create_safe_transport
 
@@ -87,21 +89,27 @@ class WebhookDelivery:
             await self.client.aclose()
         logger.info("webhook_delivery_shutdown")
 
-    def _generate_signature(self, payload: str) -> str:
-        """Generate HMAC-SHA256 signature for webhook payload.
+    @staticmethod
+    def _generate_signature(payload: str, secret: str) -> str:
+        """HMAC-SHA256 of the payload with the alert owner's webhook secret.
 
         Args:
             payload: JSON payload as string
+            secret: The user's webhook_secret
 
         Returns:
             Hex-encoded signature
         """
-        signature = hmac.new(
-            settings.secret_key.encode(),
-            payload.encode(),
-            hashlib.sha256,
-        )
-        return signature.hexdigest()
+        return hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+
+    async def _get_signing_secret(self, user_id: int) -> str | None:
+        """The alert owner's current webhook secret; None if the user is gone or
+        disabled. Read on every attempt, so a rotated secret applies to retries."""
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(User.webhook_secret).where(User.id == user_id, User.is_active.is_(True))
+            )
+            return result.scalar_one_or_none()
 
     async def queue_webhook(
         self,
@@ -174,6 +182,20 @@ class WebhookDelivery:
 
         webhook_url = alert_data["webhook_url"]
 
+        try:
+            secret = await self._get_signing_secret(int(alert_data["user_id"]))
+        except Exception as e:
+            # DB hiccup: the receiver is fine, so try again later
+            await self._handle_delivery_failure(
+                webhook_data, f"Signing secret unavailable: {e}", None, 0.0, retryable=True
+            )
+            return
+        if secret is None:
+            await self._handle_delivery_failure(
+                webhook_data, "Account disabled or deleted", None, 0.0, retryable=False
+            )
+            return
+
         # Build payload
         payload = WebhookPayload(
             alert_id=alert_id,
@@ -186,7 +208,7 @@ class WebhookDelivery:
         )
 
         payload_json = payload.model_dump_json(exclude={"signature"})
-        signature = self._generate_signature(payload_json)
+        signature = self._generate_signature(payload_json, secret)
 
         # Add signature
         payload.signature = signature

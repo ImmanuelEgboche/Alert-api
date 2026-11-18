@@ -11,8 +11,10 @@ from sqlalchemy import func, select, text
 import structlog
 
 from src.database import get_db, get_redis
-from src.models import Alert, User, WebhookLog, AlertStatus
+from src.models import Alert, User, WebhookLog, AlertStatus, generate_webhook_secret
 from src.schemas import (
+    ApiKeyRotatedResponse,
+    WebhookSecretRotatedResponse,
     AlertCreate,
     AlertResponse,
     AlertUpdate,
@@ -99,10 +101,13 @@ async def register_user(
     # Generate API key - only its hash and display prefix are persisted
     api_key = generate_api_key()
 
+    webhook_secret = generate_webhook_secret()
+
     user = User(
         email=user_data.email,
         api_key_hash=hash_api_key(api_key),
         api_key_prefix=display_prefix(api_key),
+        webhook_secret=webhook_secret,
     )
     session.add(user)
     await session.commit()
@@ -112,8 +117,55 @@ async def register_user(
 
     # The plaintext key exists only in this response
     return UserCreatedResponse(
-        **UserResponse.model_validate(user).model_dump(), api_key=api_key
+        **UserResponse.model_validate(user).model_dump(),
+        api_key=api_key,
+        webhook_secret=webhook_secret,
     )
+
+
+@router.get("/me", response_model=UserResponse)
+async def get_me(current_user: CurrentUser) -> User:
+    """The authenticated user's account (never includes secrets)."""
+    return current_user
+
+
+@router.post("/me/api-key", response_model=ApiKeyRotatedResponse)
+async def rotate_api_key(
+    current_user: CurrentUser,
+    session: AsyncSession = Depends(get_db),
+) -> ApiKeyRotatedResponse:
+    """Replace the API key. The key used for this request stops working at once.
+
+    Use it after a key leaks, or to recover access if you still hold the old
+    key. A lost key with no copy can't be recovered: register again.
+    """
+    api_key = generate_api_key()
+    current_user.api_key_hash = hash_api_key(api_key)
+    current_user.api_key_prefix = display_prefix(api_key)
+    session.add(current_user)
+    await session.commit()
+
+    logger.info("api_key_rotated", user_id=current_user.id, key_prefix=current_user.api_key_prefix)
+    return ApiKeyRotatedResponse(api_key=api_key, api_key_prefix=current_user.api_key_prefix)
+
+
+@router.post("/me/webhook-secret", response_model=WebhookSecretRotatedResponse)
+async def rotate_webhook_secret(
+    current_user: CurrentUser,
+    session: AsyncSession = Depends(get_db),
+) -> WebhookSecretRotatedResponse:
+    """Replace the webhook signing secret.
+
+    Every delivery attempt from now on (including retries of earlier alerts) is
+    signed with the new secret, so update your receiver promptly.
+    """
+    webhook_secret = generate_webhook_secret()
+    current_user.webhook_secret = webhook_secret
+    session.add(current_user)
+    await session.commit()
+
+    logger.info("webhook_secret_rotated", user_id=current_user.id)
+    return WebhookSecretRotatedResponse(webhook_secret=webhook_secret)
 
 
 @router.post("/alerts", response_model=AlertResponse, status_code=status.HTTP_201_CREATED)

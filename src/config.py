@@ -77,6 +77,9 @@ class Settings(BaseSettings):
     redis_max_connections: int = 50
 
     # Security
+    # Server-side secret. Webhooks are signed with each user's own
+    # webhook_secret, not this; production still requires a strong value so
+    # any future server-side signing never starts from a placeholder.
     secret_key: str = Field(default="change-me-in-production")
     api_key_length: int = 32
 

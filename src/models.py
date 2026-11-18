@@ -1,4 +1,5 @@
 """Database models using SQLAlchemy."""
+import secrets
 from datetime import datetime
 from enum import Enum
 from typing import Optional
@@ -15,6 +16,14 @@ from sqlalchemy import (
     func,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+WEBHOOK_SECRET_PREFIX = "whsec_"
+
+
+def generate_webhook_secret() -> str:
+    """Per-user webhook signing secret: 'whsec_' + 64 hex chars (256 bits)."""
+    return WEBHOOK_SECRET_PREFIX + secrets.token_hex(32)
 
 
 class Base(DeclarativeBase):
@@ -61,6 +70,11 @@ class User(Base):
     api_key_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
     # Non-secret leading chars ("cak_1a2b3c4d") so users/support can tell keys apart.
     api_key_prefix: Mapped[str] = mapped_column(String(12), nullable=False)
+    # Signs this user's webhooks (HMAC-SHA256). Stored retrievable because the
+    # server must sign with it; it is only ever returned by register/rotate.
+    webhook_secret: Mapped[str] = mapped_column(
+        String(80), nullable=False, default=generate_webhook_secret
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

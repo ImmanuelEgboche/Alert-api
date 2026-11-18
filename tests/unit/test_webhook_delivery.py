@@ -16,7 +16,7 @@ RETRY_DELAY = 0.2  # seconds; backoff for attempt n is 0.5-1x of RETRY_DELAY * 2
 
 def alert(alert_id: int, url: str) -> dict:
     return {
-        "id": str(alert_id), "symbol": "BTCUSDT", "condition": "price_above",
+        "id": str(alert_id), "user_id": "1", "symbol": "BTCUSDT", "condition": "price_above",
         "threshold": "50000", "webhook_url": url,
     }
 
@@ -65,6 +65,11 @@ async def rig(monkeypatch, request):
             delivered_at[alert_id] = time.perf_counter()
 
     monkeypatch.setattr(WebhookDelivery, "_log_delivery", fake_log)
+
+    async def fake_secret(self, user_id):
+        return "whsec_test"
+
+    monkeypatch.setattr(WebhookDelivery, "_get_signing_secret", fake_secret)
 
     wd = WebhookDelivery()
     await wd.initialize()

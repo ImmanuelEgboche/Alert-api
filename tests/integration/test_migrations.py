@@ -72,11 +72,18 @@ def test_pre_alembic_database_is_stamped_then_upgraded(clean_db):
     # Build the exact v1.0.0 schema, then forget it was built by Alembic
     command.upgrade(migrate.alembic_config(TEST_DATABASE_URL), migrate.BASELINE_REVISION)
     run(lambda conn: conn.execute(text("DROP TABLE alembic_version")))
+    run(lambda conn: conn.execute(text(
+        "INSERT INTO users (email, api_key_hash, api_key_prefix, is_active) VALUES "
+        "('a@x.com', 'h1', 'cak_1', true), ('b@x.com', 'h2', 'cak_2', true)"
+    )))
     assert asyncio.run(migrate._detect_state(TEST_DATABASE_URL)) == "legacy"
 
     migrate.upgrade(TEST_DATABASE_URL)
 
     assert run(current_revision) == head_revision()
+    # 0002 gave each existing user their own secret
+    secrets = run(lambda conn: conn.execute(text("SELECT webhook_secret FROM users")).scalars().all())
+    assert len(set(secrets)) == 2 and all(s.startswith("whsec_") for s in secrets)
     diff = run(lambda conn: compare_metadata(MigrationContext.configure(conn), Base.metadata))
     assert diff == []
 
