@@ -178,10 +178,18 @@ async def inspect(path: Path) -> dict[str, Any]:
     }
 
 
+def _logs_to_stderr() -> None:
+    """Keep stdout for the JSON result; structlog prints to stdout by default."""
+    import sys
+
+    structlog.configure(logger_factory=structlog.PrintLoggerFactory(sys.stderr))
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description="Summarise a recording (parser only).")
     p.add_argument("recording", type=Path)
     args = p.parse_args(argv)
+    _logs_to_stderr()
     print(json.dumps(asyncio.run(inspect(args.recording)), indent=2, default=str))
 
 

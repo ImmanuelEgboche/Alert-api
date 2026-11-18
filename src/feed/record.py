@@ -18,6 +18,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import structlog
+
 from src.config import get_settings
 from src.exchanges.base import Tick
 from src.exchanges.binance import BinanceConnection
@@ -91,6 +93,13 @@ async def record(symbols: list[str], duration: float, out: Path, progress_every:
     }
 
 
+def _logs_to_stderr() -> None:
+    """Keep stdout for the JSON result; structlog prints to stdout by default."""
+    import sys
+
+    structlog.configure(logger_factory=structlog.PrintLoggerFactory(sys.stderr))
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument("--symbols", default=DEFAULT_SYMBOLS, help="comma-separated, e.g. BTCUSDT,ETHUSDT")
@@ -98,6 +107,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--out", type=Path, default=None, help="output .jsonl.gz path")
     p.add_argument("--progress-every", type=float, default=30, help="seconds between status lines")
     args = p.parse_args(argv)
+    _logs_to_stderr()
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     out = args.out or Path("recordings") / (
