@@ -404,7 +404,7 @@ Authorization: Bearer <METRICS_TOKEN>
 Prometheus-format metrics are served separately on `METRICS_PORT` (default
 9090) for scraping; that port must only be reachable on the internal network.
 
-**Response (200 OK):**
+**Response (200 OK):** (illustrative values)
 ```json
 {
   "active_alerts": 12543,
@@ -415,6 +415,56 @@ Prometheus-format metrics are served separately on `METRICS_PORT` (default
   "uptime_seconds": 864000.0
 }
 ```
+
+---
+
+#### Pipeline Metrics
+
+Where time goes between a trade and its webhook, and whether the feed is
+complete. **Operator-only**, same token as `/metrics`.
+
+```http
+GET /api/v1/metrics/pipeline
+Authorization: Bearer <METRICS_TOKEN>
+```
+
+**Response (200 OK):** (illustrative values; one entry per stage that has samples)
+```json
+{
+  "latency": {
+    "exchange_to_receive": {"count": 104233, "mean_ms": 141.2, "p50_ms": 132.0,
+                            "p90_ms": 160.4, "p99_ms": 390.1, "p99.9_ms": 402.3, "max_ms": 911.0},
+    "receive_to_match_start": {"...": "..."},
+    "match": {"...": "..."},
+    "webhook_queue_wait": {"...": "..."},
+    "webhook_http": {"...": "..."},
+    "receive_to_delivered": {"...": "..."},
+    "exchange_to_delivered": {"...": "..."}
+  },
+  "feed": {
+    "symbols": {"binance:BTCUSDT": {"received": 51200, "expected": 51200, "missing": 0,
+                                    "gap_events": 0, "largest_gap": 0, "duplicates": 0,
+                                    "out_of_order": 0, "completeness_pct": 100.0}},
+    "total": {"received": 104233, "expected": 104233, "missing": 0, "gap_events": 0,
+              "duplicates": 0, "out_of_order": 0, "completeness_pct": 100.0}
+  },
+  "pending_matches": 0
+}
+```
+
+| Stage | From → to |
+|---|---|
+| `exchange_to_receive` | Exchange trade time → message received. Network plus exchange delay; compares two machines' clocks, so it includes clock offset |
+| `receive_to_match_start` | Received → matcher starts on it. Parsing plus queueing; grows when matching falls behind |
+| `match` | One trade through the matcher (for fired alerts, includes the DB update and enqueue) |
+| `webhook_queue_wait` | Alert fired → a delivery worker picks it up |
+| `webhook_http` | POST to your endpoint → response |
+| `receive_to_delivered` | Received → webhook delivered: everything this service controls |
+| `exchange_to_delivered` | Exchange trade time → webhook delivered |
+
+Percentiles cover the most recent 100,000 samples per stage; `count` is the
+total since startup. `feed` counts trade-ID gaps (missed trades, expected
+around reconnects), duplicates and out-of-order arrivals per symbol.
 
 ---
 

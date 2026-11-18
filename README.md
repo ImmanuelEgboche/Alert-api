@@ -89,7 +89,9 @@ is not yet wired up.
 1. One WebSocket per exchange carries every subscribed symbol. It connects in
    the background, so startup never waits on the exchange, and it reconnects
    and resubscribes whenever the connection ends.
-2. Each trade runs in its own task with its own DB session.
+2. Each trade is queued to one of `MATCH_WORKERS` match workers. A symbol
+   always goes to the same worker, so its trades are matched in order, and
+   when the queues are full the feed reader waits instead of dropping trades.
 3. `ZRANGEBYSCORE` finds alerts whose threshold has been crossed, and `ZREM`
    claims each one. Only the task that removes the alert fires it.
 4. Expired alerts are retired instead of fired. Recurring alerts move to the
@@ -379,6 +381,11 @@ their `.env.example` values:
 | `REGISTER_RATE_LIMIT_PER_HOUR` | 5 | Registrations per hour per client IP |
 | `WEBHOOK_ALLOW_PRIVATE_URLS` | false | Allow webhooks to localhost/private networks. **Local testing only**; refused in production |
 | `FORWARDED_ALLOW_IPS` | unset | Read by uvicorn: proxies trusted for `X-Forwarded-For`. Set it when behind a reverse proxy |
+| `FEED_SOURCE` | `live` | `replay` plays `REPLAY_FILE` through the pipeline instead of connecting to Binance. Refused in production |
+| `REPLAY_FILE` | unset | Recording to play when `FEED_SOURCE=replay` |
+| `REPLAY_SPEED` | 1 | 1 = real time, N = N× faster, 0 = as fast as possible |
+| `MATCH_WORKERS` | 8 | Match workers (each symbol pinned to one). Must be below `REDIS_MAX_CONNECTIONS` |
+| `MATCH_QUEUE_SIZE` | 1000 | Trades queued per worker before the feed reader waits |
 
 ## ⚠️ Known limitations
 

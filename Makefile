@@ -1,4 +1,4 @@
-.PHONY: help setup dev migrate migration test clean docker-build docker-up docker-down format lint
+.PHONY: help setup dev migrate migration test clean docker-build docker-up docker-down format lint record inspect bench
 
 # Use the project venv when it exists, so make works without activating it first
 BIN := $(if $(wildcard venv/bin/python),venv/bin/,)
@@ -10,6 +10,9 @@ help:
 	@echo "  make dev          - Start development server"
 	@echo "  make migrate      - Apply database migrations"
 	@echo "  make migration m=\"add x\" - Generate a migration from model changes"
+	@echo "  make record [d=3600] - Record the live Binance feed to recordings/"
+	@echo "  make inspect f=FILE  - Summarise a recording (trades, gaps, network delay)"
+	@echo "  make bench f=FILE [speed=0] [alerts=1000] - Replay through the pipeline and measure"
 	@echo "  make test         - Run tests"
 	@echo "  make test-cov     - Run tests with coverage"
 	@echo "  make lint         - Run linters"
@@ -33,6 +36,17 @@ migrate:
 migration:
 	@test -n "$(m)" || (echo 'Usage: make migration m="describe the change"' && exit 1)
 	@$(BIN)alembic revision --autogenerate -m "$(m)"
+
+record:
+	@$(BIN)python -m src.feed.record --duration $(or $(d),3600)
+
+inspect:
+	@test -n "$(f)" || (echo 'Usage: make inspect f=recordings/FILE.jsonl.gz' && exit 1)
+	@$(BIN)python -m src.feed.replay $(f)
+
+bench:
+	@test -n "$(f)" || (echo 'Usage: make bench f=FILE [speed=0] [alerts=1000]' && exit 1)
+	@$(BIN)python -m src.feed.bench $(f) --speed $(or $(speed),0) --alerts $(or $(alerts),1000)
 
 test:
 	@echo "Running tests..."
