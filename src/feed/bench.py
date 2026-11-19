@@ -237,6 +237,7 @@ async def run_bench(args: argparse.Namespace, log_counter: LogCounter) -> dict[s
     from src.monitoring.latency import LatencyRecorder
     from src.webhooks.delivery import WebhookDelivery
 
+    env = environment()  # at the start: the commit that actually ran
     await ensure_database(args.database_url)
     await reset_state()
 
@@ -316,7 +317,7 @@ async def run_bench(args: argparse.Namespace, log_counter: LogCounter) -> dict[s
             "seed": args.seed,
             "webhook_workers": args.webhook_workers,
         },
-        "environment": environment(),
+        "environment": env,
         "throughput": {
             "replay_wall_seconds": round(replay_done - start, 3),
             "total_wall_seconds": round(total_wall, 3),
