@@ -6,7 +6,46 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The
 
 ## [Unreleased]
 
-Tier 2: safe to open to other users. Test suite: 121 → 181 passing.
+Two parts: **measurement** (record, replay, benchmark; it found and fixed a
+data-loss bug) and **Tier 2** (safe to open to other users). Test suite:
+121 → 208 passing.
+
+### Measurement: record, replay, benchmark
+
+The project is now evaluated by replaying real recorded trades through the
+pipeline rather than by an always-on deployment. Results: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
+- **Fixed: trades were silently lost under bursts.** Every trade started its
+  own match task; a burst of more than `REDIS_MAX_CONNECTIONS` trades failed
+  with `Too many connections` and those prices were never matched, so alerts
+  could miss their crossing. *Verified:* replaying the recorded hour at 10×
+  lost 111,273 of 256,382 trades (43%) and fired 112 fewer alerts. Matching now
+  runs on `MATCH_WORKERS` ordered workers (a symbol always on the same one)
+  with bounded queues; a full queue makes the feed reader wait instead of
+  dropping trades. Redis uses a blocking pool. Now 0 lost, and every run fires
+  the same alerts.
+- **Faster matching: one Redis round trip per trade instead of four.** Match
+  p50 1.30 → 0.48 ms; max throughput 1,416 → 3,665 trades/s. Behaviour
+  unchanged (tested, including re-arm-and-fire at zero margin).
+- **Record:** `make record` captures the live Binance feed verbatim to gzip
+  JSON Lines. A one-hour recording (5 symbols, 256,382 trades, 0 gaps) is
+  committed at `benchmarks/data/binance-1h.jsonl.gz`.
+- **Replay:** `ReplayConnection` plays a recording through the same
+  `_dispatch()` and parser as the live socket, at real speed, N× or max.
+  `FEED_SOURCE=replay` runs the whole app on a recording (refused in
+  production).
+- **Stage timings:** exchange → receive → match → webhook queue → HTTP →
+  delivered, as p50–p99.9, at `GET /api/v1/metrics/pipeline` (operator token).
+- **Completeness:** trade-ID gaps, duplicates and reordering counted per
+  symbol, logged as `trade_gap` and reported by the same endpoint.
+- **Benchmarks:** `make bench` replays a recording through the real matcher,
+  Redis, Postgres and webhook delivery (its own database) and writes a JSON
+  report with the commit and machine. Results for each version are in
+  `benchmarks/results/`.
+- Binance trade timestamps are UTC-aware (were naive local time, stored wrong
+  in `triggered_at` on a non-UTC server).
+- New settings: `FEED_SOURCE`, `REPLAY_FILE`, `REPLAY_SPEED`,
+  `MATCH_WORKERS` (must be below `REDIS_MAX_CONNECTIONS`), `MATCH_QUEUE_SIZE`.
 
 ### Upgrade steps (existing deployments)
 
@@ -277,7 +316,8 @@ the stale-feed watchdog.
 
 ### Tier 2: safe for other users
 
-Done except hosting (see [Unreleased]):
+Done (see [Unreleased]). Hosting was dropped: the project is evaluated by
+replay benchmarks instead of an always-on deployment.
 
 - [x] SSRF protection for webhook URLs
 - [x] Per-user webhook signing secrets
@@ -285,16 +325,23 @@ Done except hosting (see [Unreleased]):
 - [x] API key rotation endpoint
 - [x] Alembic migrations
 - [x] Own git repo and CI
-- [ ] **HTTPS hosting.** Not chosen yet. Options: a VPS with Caddy in front
-      of the production Compose stack, or a managed platform (Fly.io,
-      Railway). Set `FORWARDED_ALLOW_IPS` behind any proxy.
-- [x] README accuracy: unmeasured claims removed (benchmarks still to do;
-      see below)
+- [-] ~~HTTPS hosting~~: not pursued. Self-hosters: put a reverse proxy
+      with HTTPS in front and set `FORWARDED_ALLOW_IPS`.
+- [x] README accuracy: unmeasured claims removed, then replaced with
+      measured ones
 
 ### Later / nice to have
 
-- [ ] Benchmark matching latency (1K/10K/100K alerts), sustained trades/sec
-      and memory per alert, with a reproducible script.
+- [x] Benchmark latency and throughput with a reproducible script
+      (`make bench`; 1K and 10K alerts). Still unmeasured: 100K alerts,
+      memory per alert.
+- [ ] Raise per-symbol burst capacity. At real speed the p99 (254 ms trade
+      received → webhook delivered) is queueing behind BTC bursts above
+      ~1,100 trades/s, one worker's limit.
+- [ ] Move the fired-alert Postgres update off the match path (it is most of
+      the match p99.9 tail, and why 10× the alerts costs 37% of throughput).
+- [ ] Burst conflation for one-shot alerts (match a backed-up batch's high and
+      low instead of every trade).
 - [ ] Replay protection: sign a timestamp with each webhook so receivers can
       reject old deliveries.
 - [ ] Encrypt webhook secrets at rest (a database leak currently exposes
@@ -304,8 +351,8 @@ Done except hosting (see [Unreleased]):
       on restart.
 - [ ] Persist the re-arm state. A restart re-arms every recurring alert, so it
       may fire once more.
-- [ ] A Lua script for atomic match-and-claim, cutting about 3 Redis round
-      trips per fired alert to 1.
+- [ ] A Lua script for atomic claim-and-fetch, cutting the 2-3 Redis round
+      trips per *fired* alert to 1 (quiet trades are already 1 round trip).
 - [ ] Partial index on `alerts(expires_at) WHERE status IN ('active','paused')`
       for the expiry sweep at scale.
 - [ ] Stale-feed watchdog. Keepalive pings detect a dead TCP connection, but

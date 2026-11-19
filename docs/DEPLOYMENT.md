@@ -1,5 +1,10 @@
 # Deployment Guide
 
+> **Scope:** this guide is for self-hosting. The project itself isn't run as
+> an always-on public service; it's evaluated by replaying a recorded hour of
+> trades (see [BENCHMARKS.md](BENCHMARKS.md)). The cloud sections below are
+> starting points, not tested deployments.
+
 Complete guide for deploying Crypto Alert API to production.
 
 ## Table of Contents

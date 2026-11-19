@@ -24,9 +24,15 @@ open http://localhost:8000/docs
 
 | Metric | Value | Proof Location |
 |--------|-------|----------------|
-| **Lines of Code** | 2,500+ | `wc -l src/**/*.py` |
+| **Throughput** | 3,665 trades/s (51× real time) | `docs/BENCHMARKS.md` |
+| **Match latency** | p50 0.48 ms, p99 1.87 ms | `benchmarks/results/v3-pipelined-max-speed.json` |
+| **Bug found by replay** | 43% of trades lost under real bursts, fixed | `docs/BENCHMARKS.md` |
+| **Feed completeness** | 256,382 trades, 0 gaps | `make inspect f=benchmarks/data/binance-1h.jsonl.gz` |
+| **Algorithm** | O(log n + k), one Redis round trip per trade | `src/core/matcher.py` |
 | **Test Coverage** | 80%+ | `pytest --cov=src` |
-| **Algorithm** | O(log n + k) | `src/core/matcher.py:67` |
+
+All measured on an M2 laptop with local Postgres/Redis, replaying one real hour
+of Binance trades with 1,000 alerts. Say so when you quote them.
 
 ---
 
@@ -79,7 +85,7 @@ async def match_price_update(symbol, price):
 ## 💡 Key Interview Talking Points
 
 ### 1. Performance
-"Redis sorted sets make matching O(log n + k) per trade instead of an O(n) scan of every alert." (Latency not benchmarked yet; don't quote a number.)
+"I recorded an hour of real Binance trades and replay it through the production pipeline. The first replay showed it lost 43% of trades in bursts; after fixing that and pipelining the Redis lookups, it does 3,665 trades/s with a 0.48 ms median match, losing none." Matching is O(log n + k) with Redis sorted sets.
 
 ### 2. Efficiency
 "One WebSocket per exchange carries every subscribed symbol, so N alerts share one connection instead of opening one each."
@@ -104,6 +110,11 @@ async def match_price_update(symbol, price):
 2. `tests/unit/test_matcher.py` - Test coverage
 3. `src/webhooks/delivery.py` - Retry logic
 
+### For Measurement
+1. `docs/BENCHMARKS.md` - Results, method, caveats
+2. `src/feed/replay.py` - Replay through the live code path
+3. `src/feed/bench.py` - Benchmark harness
+
 ### For Interview Prep
 1. `docs/INTERVIEW_GUIDE.md` - Talking points
 2. `PROJECT_SUMMARY.md` - Quick overview
@@ -125,6 +136,12 @@ make format        # Format code
 make docker-up     # Start all services
 make docker-down   # Stop all services
 make docker-logs   # View logs
+
+# Record / replay / benchmark
+make record                                       # capture an hour of live trades
+make inspect f=benchmarks/data/binance-1h.jsonl.gz # trades, gaps, network delay
+make bench f=benchmarks/data/binance-1h.jsonl.gz   # replay through the pipeline
+FEED_SOURCE=replay REPLAY_FILE=benchmarks/data/binance-1h.jsonl.gz make dev
 
 # Testing
 pytest tests/unit                    # Unit tests
@@ -254,7 +271,7 @@ This project showcases skills for:
 
 vs. Typical Portfolio Projects:
 1. ✅ **Production-grade** (not a toy project)
-2. ✅ **Honest metrics** (complexity from the design; latency to be benchmarked)
+2. ✅ **Measured on real data** (committed recording; every number reproducible)
 3. ✅ **Real problem** (actual developer need)
 4. ✅ **Complete docs** (200+ pages)
 5. ✅ **Scalability** (horizontal scaling strategy)
@@ -266,7 +283,7 @@ vs. Typical Portfolio Projects:
 
 ```bash
 # Repository structure
-/Users/immanuelegboche/.claude-worktrees/work/confident-rosalind/crypto-alert-api
+crypto-alert-api/
 
 # Start here
 README.md
@@ -282,7 +299,7 @@ make setup && make dev
 
 ## ⚡ One-Liner Summary
 
-> "Crypto alert API that matches live Binance trades against alerts in O(log n + k) with Redis sorted sets, multiplexes every symbol over one WebSocket, and delivers signed webhooks with retries, hardened against SSRF and abuse."
+> "Crypto alert pipeline, measured on a recorded hour of real Binance trades: 3,665 trades/s, 0.48 ms median match, zero trades lost, after replay exposed a 43% loss under bursts in the first design."
 
 ---
 

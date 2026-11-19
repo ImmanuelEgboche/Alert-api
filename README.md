@@ -17,21 +17,35 @@ their own exchange WebSocket connections.
 
 ### Project status
 
-**Safe for other users; not yet hosted publicly.** The full pipeline (live
-Binance trade → match → signed webhook) has been tested against the real
-Binance feed, and there's a [production Compose setup](#run-in-production).
-Webhook URLs can't reach internal addresses, each user verifies webhooks with
-their own secret, and requests are rate limited. CI runs lint and the full
-test suite on every push.
+**Measured, not hosted.** Rather than run an always-on public service, the
+project's evidence is a committed hour of real Binance trades (256,382 of
+them) that replays through the production pipeline on demand, with every stage
+timed. Those replays found a bug that lost 43% of trades under real bursts,
+and drove the fix and a 2.6× speed-up: see [Benchmarks](#-benchmarks).
 
-What's left is in [Known limitations](#-known-limitations): mainly HTTPS
-hosting and durability across restarts. The full list of changes is in
-[CHANGELOG.md](CHANGELOG.md).
+It still runs live: point it at Binance (the default) and it streams, matches
+and delivers signed webhooks, with a [production Compose
+setup](#run-in-production) if you want to self-host. Webhook URLs can't reach
+internal addresses, each user verifies webhooks with their own secret, and
+requests are rate limited. CI runs lint and the full test suite on every push.
+The full list of changes is in [CHANGELOG.md](CHANGELOG.md).
 
 ### Features
 
+- **Record and replay**: capture the live exchange feed to disk, verbatim,
+  and play it back through the same pipeline at real speed, N× or as fast as
+  possible. `FEED_SOURCE=replay` runs the whole app on a recording.
+- **Every stage timed**: exchange → received → matched → webhook delivered,
+  as p50/p90/p99/p99.9 per stage, live at `/api/v1/metrics/pipeline` and in
+  benchmark reports.
+- **Feed completeness checks**: trade IDs are tracked per symbol, so missed,
+  duplicated or out-of-order trades are counted, not guessed at.
 - **Fast alert matching**: Redis sorted sets give O(log n + k) matching per
-  trade, instead of scanning every alert.
+  trade, in one Redis round trip: 0.48 ms p50, 3,665 trades/s on a laptop
+  ([benchmarks](docs/BENCHMARKS.md)).
+- **Ordered and lossless under bursts**: each symbol's trades are matched in
+  order by a bounded worker pool; when it falls behind, the feed waits rather
+  than dropping trades.
 - **Fires exactly once**: alerts are claimed atomically before firing, so
   concurrent trades can't double-fire an alert.
 - **Recurring alerts**: fire once per threshold crossing, then re-arm only after
@@ -98,6 +112,30 @@ is not yet wired up.
    re-arm set.
 5. The webhook is queued. Workers deliver it, and failures retry on timers so
    no worker sits idle waiting for a backoff.
+
+## 📊 Benchmarks
+
+One hour of Binance trades (5 symbols, 256,382 trades, bursts up to 3,110/s)
+replayed through the real matcher, Redis, Postgres and webhook delivery, with
+1,000 alerts. Full method, caveats and raw results: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
+| | v1: task per trade | v2: ordered workers | v3: + one Redis round trip |
+|---|---|---|---|
+| Trades lost under real bursts (10× replay) | **111,273 (43%)** | 0 | 0 |
+| Max throughput | 4,619/s (while losing trades) | 1,416/s | **3,665/s** (51× real time) |
+| Match time per trade, p50 / p99 | 4.72 / 13.63 ms | 1.30 / 3.66 ms | **0.48 / 1.87 ms** |
+
+At the recording's **real timing**, every trade is matched in order and each
+webhook is delivered **40 ms (p50) / 254 ms (p99)** after the trade reaches
+us, or 114 / 387 ms from Binance's own trade timestamp. Matching is under
+1 ms; the tail is queueing in bursts (84% of trades arrive while their symbol
+trades at ≥100/s), which is the next thing to fix.
+
+```bash
+make inspect f=benchmarks/data/binance-1h.jsonl.gz    # what's in the recording
+make bench f=benchmarks/data/binance-1h.jsonl.gz      # replay + measure
+make record                                            # capture your own hour
+```
 
 ## 🚀 Quick Start
 
@@ -170,6 +208,19 @@ make dev                                  # API with auto-reload on :8000
 
 `make` targets use `venv/bin/` automatically, so you don't need to activate the
 venv for `make dev`, `make test` or `make lint`.
+
+### Run on a recording instead of the live feed
+
+No exchange connection needed; prices come from the committed hour of trades:
+
+```bash
+FEED_SOURCE=replay REPLAY_FILE=benchmarks/data/binance-1h.jsonl.gz REPLAY_SPEED=10 make dev
+```
+
+Playback starts when the first symbol is subscribed (at startup if alerts
+already exist, otherwise when you create one), plays only subscribed symbols,
+and plays the file once; restart to play it again. Webhook `triggered_at` is
+the recorded trade time. Production refuses `FEED_SOURCE=replay`.
 
 ### Using the API
 
@@ -347,8 +398,11 @@ make lint          # ruff + mypy
 make test-load
 ```
 
-What's covered: alert matching and the re-arm logic, concurrent double-fire
-protection, the webhook worker pool, retry policy and backoff, API-key storage
+What's covered: alert matching and the re-arm logic (including one Redis
+round trip per quiet trade), concurrent double-fire protection, ordered and
+lossless matching under a burst (fails on the old task-per-trade design), the
+recording format (including truncated files), replay pacing and symbol
+filtering, trade-ID gap/duplicate detection, latency percentiles, the webhook worker pool, retry policy and backoff, API-key storage
 and auth, SSRF blocking (including DNS rebinding), per-user webhook signatures
 and key/secret rotation, rate limits, migrations (they must match the models,
 and v1.0.0 databases must be adopted), expiry (unit and Postgres), metrics
@@ -392,36 +446,60 @@ their `.env.example` values:
 These come from an end-to-end test against the live container. Full list with
 details: [CHANGELOG.md → To do](CHANGELOG.md#to-do).
 
-**Hosting:** not deployed publicly yet. HTTPS is up to you: put a reverse
-proxy in front (and set `FORWARDED_ALLOW_IPS`).
+**Hosting:** not run as a public service, by design (see [Project
+status](#project-status)). To self-host, put a reverse proxy with HTTPS in
+front and set `FORWARDED_ALLOW_IPS`.
 
 **Reliability:** keepalive pings catch a dead connection, but not a feed that
 stays connected while trades stop arriving. A watchdog for that is planned.
 
 **Scale/durability:** run a single API process (each would open its own feeds
 and webhook queue). Pending webhook retries and recurring re-arm state are held
-in memory and lost on restart. Performance has not been benchmarked yet.
+in memory and lost on restart. A fired alert's Postgres update runs inside
+the match step, which is most of the p99.9 match time
+([benchmarks](docs/BENCHMARKS.md#next-steps-the-numbers-point-to)).
 
 ## 🎓 Interview Talking Points
 
-### 1. Performance
+### 1. Measurement (the strongest story)
+- "I recorded an hour of real Binance trades and replay it through the
+  production pipeline, timing every stage. The recording is committed, so
+  every number in the README is reproducible."
+- "The first replay found that the pipeline lost trades under bursts. One task
+  per trade meant a burst bigger than the Redis pool failed with 'Too many
+  connections'. At 10× speed it lost 43% of the hour's trades and fired 112
+  fewer alerts. The averages looked fine: 72 trades/s. The problem lived in
+  the bursts: 3,110 in one second, 57 in one millisecond."
+- "The fix (ordered per-symbol workers with backpressure) was correct but made
+  BTC a serial bottleneck. The per-stage numbers showed match time was four
+  Redis round trips per trade; pipelining them took match p50 from 1.3 ms to
+  0.48 ms and throughput from 1,416 to 3,665 trades/s."
+- "Trade IDs are sequential per symbol, so completeness is a counted fact:
+  the recording has 256,382 trades and zero gaps."
+
+### 2. Performance
 - "Alert matching uses Redis sorted sets: `ZRANGEBYSCORE` is O(log n + k) per
-  trade instead of an O(n) scan of every alert."
+  trade instead of an O(n) scan of every alert. The cost is in alerts that
+  fire, not alerts that exist: each fired alert writes to Postgres inside the
+  match step, so 10× the alerts (and 10× the firings) cost 37% of throughput,
+  and that write is the next thing to move."
 - "I replaced bcrypt API-key checks (226 ms of CPU per request, blocking the
   event loop) with an indexed SHA-256 lookup (about 6 µs). bcrypt protects
   low-entropy passwords; a 256-bit random key doesn't need it."
 - "One WebSocket per exchange carries every symbol, so N alerts share one
   connection."
 
-### 2. Concurrency and correctness
-- "Trades are processed concurrently, so two ticks could match the same alert.
-  Using `ZREM` as an atomic claim means exactly one task fires it."
+### 3. Concurrency and correctness
+- "Using `ZREM` as an atomic claim means exactly one task fires an alert, even
+  across processes. Within one process, each symbol's trades are also matched
+  in order by a single worker, so outcomes don't depend on scheduling: every
+  benchmark run fires exactly the same 1,568 alerts."
 - "Recurring alerts use edge triggering with hysteresis. A re-arm set scored by
   re-arm price makes 'what should re-arm now' the same O(log n + k) query."
 - "`AsyncSession` isn't safe for concurrent use, so each trade gets its own
   pooled session. Sharing one session was the original bug."
 
-### 3. Reliability
+### 4. Reliability
 - "Webhook retries run on timers, not inside workers. The original code slept
   inside the only worker, so one dead endpoint stalled every customer and
   could deadlock the queue."
@@ -436,7 +514,7 @@ in memory and lost on restart. Performance has not been benchmarked yet.
 - "Expiry is enforced in two layers: a fire-time check guarantees correctness,
   and a sweep handles housekeeping."
 
-### 4. Security
+### 5. Security
 - "Users choose where the server sends POST requests, which is an SSRF risk.
   I verified the server would hit the cloud metadata IP, then blocked
   non-public addresses inside the HTTP client's connect step. Checking at
@@ -450,7 +528,7 @@ in memory and lost on restart. Performance has not been benchmarked yet.
   now has their own, read at every delivery attempt so rotation applies to
   pending retries."
 
-### 5. Observability
+### 6. Observability
 - "Prometheus labels use route templates, not raw paths, to keep label
   cardinality bounded."
 - "Operator stats require a separate bearer token, because platform-wide data
@@ -463,10 +541,11 @@ in memory and lost on restart. Performance has not been benchmarked yet.
   mode at startup, rather than running insecurely and logging a warning
   nobody reads."
 
-### 6. Trade-offs and what's next
+### 7. Trade-offs and what's next
 - "Redis vs in-process memory: Redis lets several instances share alert state,
   and the atomic claim still holds across processes. The cost is a network
-  round trip; a Lua script could combine match and claim into one call."
+  round trip, which the benchmarks made visible; pipelining cut a quiet trade
+  to one. A Lua script could make firing one call too."
 - "The webhook queue is in memory: simple and fast, but pending retries are
   lost on restart. The next step is a Redis sorted set scored by next-attempt
   time."

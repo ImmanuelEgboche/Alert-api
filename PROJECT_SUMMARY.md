@@ -4,7 +4,7 @@
 
 **Production-grade cryptocurrency alert infrastructure API built to demonstrate systems engineering skills for quantitative data engineering roles at top trading firms.**
 
-**Status**: ✅ Complete and ready for deployment
+**Status**: Feature-complete for self-hosting; evaluated by reproducible replay benchmarks rather than an always-on deployment
 
 ---
 
@@ -14,8 +14,12 @@ A real-time cryptocurrency price monitoring service that:
 - Streams live trades from Binance (a Coinbase adapter exists, not yet wired up)
 - Matches them against alerts with Redis sorted sets (O(log n + k) per trade)
 - Delivers signed webhooks with retries, backoff and per-attempt logging
+- Records the raw feed to disk and replays it through the same pipeline, timing
+  every stage and counting missed trades by trade ID
 
-Performance has not been benchmarked yet, so this document makes no latency, throughput or uptime claims.
+Measured on one real hour of Binance trades (256,382 trades, M2 laptop):
+3,665 trades/s, match p50 0.48 ms, zero trades lost. The first replay found the
+original design lost 43% of trades under bursts. Details: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ---
 
@@ -126,18 +130,17 @@ crypto-alert-api/
 ## Key Features Implemented
 
 ### 1. Performance Optimizations
-✅ O(log n) alert matching using Redis sorted sets
-✅ WebSocket connection multiplexing (1000:1 ratio)
+✅ O(log n + k) alert matching using Redis sorted sets, one round trip per quiet trade
+✅ One WebSocket per exchange for every subscribed symbol
+✅ Ordered, bounded match workers with backpressure (no dropped trades)
 ✅ Async I/O throughout (non-blocking)
 ✅ Connection pooling (database, Redis, HTTP)
-✅ In-memory caching with LRU eviction
-✅ Batch webhook processing
 
 ### 2. Reliability Engineering
 ✅ Automatic WebSocket reconnection with exponential backoff
 ✅ Webhook retry logic (3 attempts, exponential backoff)
 ✅ Non-retryable errors fail fast (no retry storm on 404s)
-✅ Dead letter queue for failed webhooks
+✅ Every delivery attempt logged per alert
 ✅ Health checks for all services
 ✅ Graceful shutdown handling
 
@@ -149,11 +152,10 @@ crypto-alert-api/
 ✅ Load balancer ready (Nginx config included)
 
 ### 4. Observability
-✅ Prometheus metrics (15+ metrics)
+✅ Per-stage latency percentiles (exchange → webhook) at `/api/v1/metrics/pipeline`
+✅ Trade-ID completeness checks (gaps, duplicates, reordering)
+✅ Prometheus HTTP metrics, labelled by route template
 ✅ Structured JSON logging
-✅ Request correlation IDs
-✅ Grafana dashboards configured
-✅ Alerting rules defined
 ✅ Webhook delivery tracking
 
 ### 5. Security
@@ -178,8 +180,16 @@ crypto-alert-api/
 
 ## Performance Benchmarks
 
-Not measured yet. Planned: matching latency at 1K/10K/100K alerts, trades per
-second sustained, and memory per alert, with a script to reproduce them.
+Replaying a committed hour of Binance trades through the real pipeline
+(1,000 alerts, M2 laptop, local Postgres/Redis). Full results: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
+| | v1: task per trade | v2: ordered workers | v3: + one Redis round trip |
+|---|---|---|---|
+| Trades lost under real bursts (10×) | 111,273 (43%) | 0 | 0 |
+| Max throughput | 4,619/s (while losing trades) | 1,416/s | 3,665/s |
+| Match p50 / p99 | 4.72 / 13.63 ms | 1.30 / 3.66 ms | 0.48 / 1.87 ms |
+
+Not measured: memory per alert, multiple processes, separate hosts.
 
 ---
 
@@ -234,9 +244,12 @@ second sustained, and memory per alert, with a script to reproduce them.
 ✅ Data structures (sorted sets)
 
 ### Quantifiable Metrics for CV
+✅ **3,665 trades/s**, match **p50 0.48 ms / p99 1.87 ms**, replaying a real hour
+✅ Found and fixed a bug that lost **43% of trades** under real bursts
+✅ **2.6×** throughput from removing three Redis round trips per trade
+✅ **256,382** real trades recorded, **0** gaps
+✅ **40 ms p50 / 254 ms p99** from trade received to webhook delivered, at real speed
 ✅ **O(log n + k)** matching complexity
-✅ **2,500 lines** production code
-✅ **80%+ test coverage**
 
 ### Demo-Ready Features
 ✅ One-command setup (`make setup`)
@@ -261,12 +274,14 @@ docker-compose -f docker-compose.prod.yml up -d
 # Complete stack with monitoring
 ```
 
-### Cloud Platforms
-- **AWS**: ECS/Fargate + RDS + ElastiCache
-- **GCP**: Cloud Run + Cloud SQL + Memorystore
-- **DigitalOcean**: App Platform + Managed Database
+### On a recording (no exchange connection)
+```bash
+FEED_SOURCE=replay REPLAY_FILE=benchmarks/data/binance-1h.jsonl.gz make dev
+make bench f=benchmarks/data/binance-1h.jsonl.gz
+```
 
-**Estimated Cost**: $20-50/month for demo deployment
+An always-on public deployment is deliberately out of scope; the replay
+benchmarks are the evidence.
 
 ---
 
@@ -297,15 +312,15 @@ docker-compose -f docker-compose.prod.yml up -d
 ## Success Criteria Achievement
 
 ### Technical Metrics (for CV)
-- [ ] Latency and throughput benchmarked (not yet)
-- [ ] Uptime measured on a public deployment (not yet)
+- [x] Latency and throughput benchmarked on real recorded trades
+- [x] Feed completeness measured (trade-ID gaps)
 - [ ] Second exchange wired up (Coinbase adapter exists)
 - [ ] More than one API instance demonstrated
 
 ### Code Quality
 - ✅ Production-ready architecture
 - ✅ Comprehensive test suite
-- ✅ Full type safety (mypy strict)
+- ✅ Type hints throughout (mypy strict configured)
 - ✅ Monitoring and observability
 - ✅ Security best practices
 - ✅ Clean, documented code
@@ -322,11 +337,11 @@ docker-compose -f docker-compose.prod.yml up -d
 ## Key Interview Talking Points
 
 ### 30-Second Pitch
-"I built a crypto alert API that streams live Binance trades, matches them against alerts in O(log n + k) with Redis sorted sets, and delivers signed webhooks through a worker pool with retries. Along the way I fixed real concurrency and reliability bugs: double-firing alerts, a shared DB session across tasks, and a feed that silently died after 24 hours. It also blocks SSRF via webhook URLs, which is the main risk in letting users choose where the server sends requests."
+"I built a pipeline that turns live Binance trades into signed webhooks when price alerts trigger, and measured it on real data: I recorded an hour of trades and replay it through the production code with every stage timed. The first replay showed it lost 43% of trades under real bursts; after fixing that and removing the next bottleneck the numbers pointed to, it handles 3,665 trades/s at 0.48 ms per match on a laptop, losing none. Along the way: exactly-once firing, a feed that silently died after 24 hours, and SSRF via webhook URLs."
 
 ### Technical Highlights
-1. **Algorithm**: O(log n) matching with Redis sorted sets
-2. **Efficiency**: WebSocket multiplexing (1000:1 connection reduction)
+1. **Measurement**: record/replay with per-stage p99s and trade-ID completeness
+2. **Algorithm**: O(log n + k) matching with Redis sorted sets, one round trip per trade
 3. **Reliability**: Exponential backoff retries with jitter; self-healing exchange feed
 4. **Scalability**: Horizontal scaling with stateless architecture
 5. **Observability**: HTTP metrics in Prometheus, structured logs, readiness checks

@@ -6,11 +6,12 @@ This guide helps you present this project effectively in technical interviews at
 
 ## Executive Summary (30 seconds)
 
-> "I built a crypto alert API that streams live Binance trades and sends signed webhooks when price conditions trigger. Redis sorted sets make matching O(log n + k) per trade instead of scanning every alert, one WebSocket carries every symbol, and webhook delivery runs on a worker pool with retries and backoff. It's hardened for other users: SSRF-safe webhook URLs, per-user signing secrets, rate limits and key rotation."
+> "I built a pipeline that turns live Binance trades into signed webhooks when price alerts trigger, and then measured it properly. I recorded an hour of real trades, 256,000 of them, and replay that through the production code with every stage timed. The first replay showed the pipeline lost 43% of trades under real bursts. I fixed that, then used the per-stage numbers to find and remove the next bottleneck: matching went from 1.3 to 0.48 milliseconds per trade, and throughput from 1,400 to 3,700 trades a second on a laptop, with zero trades lost."
 
-> **Don't quote latency or throughput numbers.** Nothing has been benchmarked
-> yet. If asked, say so and explain how you'd measure it (see "What's your p99
-> latency" below). That answer lands better than an unbacked number.
+> **Numbers you can quote** all come from [BENCHMARKS.md](BENCHMARKS.md), which
+> says how they were measured and what they don't show (one laptop, local
+> Postgres/Redis, Python 3.10). Quote them with that context: "on an M2
+> laptop, replaying a real hour" is more credible than a bare number.
 
 ## Key Technical Highlights
 
@@ -30,7 +31,11 @@ await redis.zadd(f"symbol:{symbol}:price_above", {alert_id: threshold})
 triggered = await redis.zrangebyscore(symbol_key, "-inf", current_price)
 ```
 
-**Results:** not benchmarked yet. The claim you can defend is the complexity.
+**Results:** one Redis round trip per trade; match p50 0.48 ms, p99 1.87 ms,
+3,665 trades/s replaying a real hour with 1,000 alerts. Ten times the alerts
+(10,000, firing ten times as often) cost 37% of throughput, consistent with
+O(log n + k): the cost is in the k alerts that fire (a Postgres write each,
+inside the match step), not the n that exist.
 
 **Interview Talking Point:**
 "I chose Redis sorted sets over a naive O(n) scan: each trade does one range query, O(log n + k), where k is the number of alerts that actually fire, instead of checking every alert. The trade-off is a network round trip to Redis versus pure in-memory, but several instances can share alert state, and the atomic ZREM claim still prevents double-firing across processes."
@@ -78,8 +83,8 @@ Before:                After:
 - HMAC signature for verification
 
 **Limits:** the in-memory queue holds up to `MAX_WEBHOOK_QUEUE_SIZE` (10K)
-webhooks. Delivery latency is mostly the receiver's response time and isn't
-benchmarked.
+webhooks. With an instant local receiver, queue wait is 0.2 ms p50 and the
+HTTP call 1.3 ms p50; a real receiver's response time dominates.
 
 **Interview Talking Point:**
 "I implemented webhooks as a separate async queue to decouple delivery from the critical alert matching path. If a webhook endpoint is slow or down, it doesn't affect other users. The exponential backoff prevents thundering herd when services recover, and we track all attempts for debugging."
@@ -166,14 +171,25 @@ def match_price_update(symbol: str, price: float):
 
 ## Performance Benchmarks
 
-Not measured yet. The plan, so you can describe it if asked:
+Full method, results and caveats: [BENCHMARKS.md](BENCHMARKS.md). The story in
+three steps, each driven by a number:
 
-- **Matching latency**: time `AlertMatcher.process_price_update` with 1K, 10K
-  and 100K armed alerts for one symbol; report p50/p99/p999.
-- **Throughput**: replay recorded Binance trades as fast as possible and count
-  sustained trades/second.
-- **Memory**: Redis `INFO memory` before and after loading N alerts.
-- **API**: `make test-load` (Locust) against one instance.
+1. **Record.** One hour of Binance trades, five symbols, 256,382 trades, no
+   gaps (trade IDs are sequential, so completeness is counted). Average 72/s,
+   but 3,110 in the busiest second and 57 in a single millisecond.
+2. **Replay found data loss.** One task per trade exhausted the 50-connection
+   Redis pool during bursts. At 10× replay: 111,273 trades (43%) never matched,
+   112 alerts never fired. Fix: ordered per-symbol workers with backpressure.
+   Zero lost; every run fires the same 1,568 alerts.
+3. **Per-stage timing found the next bottleneck.** Per-symbol ordering made
+   BTC serial, and `match` was four Redis round trips. Pipelining them: match
+   p50 1.30 → 0.48 ms, throughput 1,416 → 3,665 trades/s.
+
+**If asked "how did you measure it?":** stage timestamps on every trade
+(monotonic clock for internal stages, exchange timestamp for network delay),
+nearest-rank percentiles over every sample, replaying a committed recording
+through the same `_dispatch()` and parser the live feed uses, with seeded
+alerts so runs are comparable.
 
 ---
 
@@ -283,9 +299,11 @@ async def connect(self) -> None:
 
 ## Lessons Learned
 
-### 1. Premature Optimization
-**Mistake:** Initially tried to optimize everything.
-**Learning:** Profile first. The alert matching was the only true bottleneck.
+### 1. Averages hide the failure
+**Mistake:** The design looked fine for 72 trades/s, the hour's average.
+**Learning:** Test with real bursts. Replaying the recording at its real
+timing reproduced 57 trades in one millisecond, and that is what broke it.
+Measure first, then optimise the stage the numbers point at.
 
 ### 2. WebSocket Reliability
 **Challenge:** Exchange WebSockets disconnect randomly.
@@ -341,16 +359,9 @@ For production, add usage-based pricing to naturally limit abuse."
 ### "What's your p99 latency and why does it matter?"
 
 **Answer:**
-"I haven't benchmarked it yet, so I won't quote a number. Here's how I'd measure it: time the match step with 1K, 10K and 100K alerts loaded and report p50/p99/p999. p99 means 99% of price updates are processed within that time. It matters for trading applications where milliseconds count.
+"Replaying a real hour at its recorded timing on an M2 laptop, a webhook is delivered 40 ms after the trade reaches us at p50 and 254 ms at p99; from Binance's own trade timestamp it's 114 and 387 ms, about 58 ms of which (median) is the network to Binance. Matching itself is under a millisecond. The p99 is queueing: 84% of trades arrive while their symbol is trading at 100+ a second, and BTC bursts exceed what one worker can match, about 1,100 a second, so trades wait behind each other. The next fix is per-symbol burst capacity: for one-shot alerts, matching a backed-up burst's high and low in one step is equivalent to matching every trade."
 
-I chose p99 over p50 because in finance, tail latency kills you. One slow alert that takes 200ms might miss a trading opportunity. By optimizing for p99, we ensure consistent performance even under load.
-
-Techniques used:
-- O(log n) algorithms
-- In-memory hot path (Redis)
-- Async I/O throughout
-- Connection pooling
-- Careful memory management"
+p99 matters more than p50 because alerts fire in exactly the moments the market moves fastest, which are the bursts. The first version had a fine average and lost 43% of trades in those bursts. So I track every stage's p99 and p99.9, and the replay benchmark is how I check a change didn't move the tail."
 
 ---
 
@@ -363,9 +374,11 @@ crypto-alert-api/
 ├── docs/
 │   ├── INTERVIEW_GUIDE.md  # This file
 │   ├── API.md             # API documentation
-│   └── DEPLOYMENT.md      # Production deployment
+│   ├── BENCHMARKS.md      # Measured results and method ⭐
+│   └── DEPLOYMENT.md      # Self-hosting
 ├── src/
 │   ├── core/              # Alert matching engine ⭐
+│   ├── feed/              # Record, replay, completeness, benchmark ⭐
 │   ├── exchanges/         # WebSocket connections
 │   ├── webhooks/          # Delivery system
 │   └── monitoring/        # Prometheus metrics
@@ -373,7 +386,9 @@ crypto-alert-api/
 │   ├── unit/              # Unit tests
 │   ├── integration/       # API tests
 │   └── load/              # Performance tests
-└── benchmarks/            # Performance benchmarks
+└── benchmarks/
+    ├── data/              # One hour of real Binance trades
+    └── results/           # Every benchmark run, as JSON
 
 ⭐ = Most important to discuss in interviews
 ```
@@ -383,7 +398,7 @@ crypto-alert-api/
 ## What Makes This Project Stand Out
 
 1. **Production-Ready**: Full monitoring, logging, error handling, tests
-2. **Performance Focus**: Benchmarked, optimized, measurable latency
+2. **Measured on real data**: a committed recording, reproducible numbers, and a bug the numbers found
 3. **Systems Thinking**: Trade-offs, scaling strategy, reliability patterns
 4. **Clean Code**: Type-safe, documented, tested, maintainable
 5. **Real-World Problem**: Solves actual developer need (webhook infrastructure)
@@ -396,8 +411,9 @@ crypto-alert-api/
 # 1. Show architecture diagram
 open ARCHITECTURE.md
 
-# 2. Start system
-make setup && make dev
+# 2. Start system on the recorded hour (no live connection needed)
+make setup
+FEED_SOURCE=replay REPLAY_FILE=benchmarks/data/binance-1h.jsonl.gz REPLAY_SPEED=10 make dev
 
 # 3. Create alert via API
 curl -X POST http://localhost:8000/api/v1/register \
@@ -419,8 +435,9 @@ open http://localhost:3000
 # 5. Show code: Alert matcher
 code src/core/matcher.py
 
-# 6. Run benchmark
-pytest tests/unit/test_matcher.py -v --benchmark
+# 6. Run the benchmark (about 70 s at max speed)
+make bench f=benchmarks/data/binance-1h.jsonl.gz
+open docs/BENCHMARKS.md
 ```
 
 ---

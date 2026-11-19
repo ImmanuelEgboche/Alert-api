@@ -3,8 +3,10 @@
 ## Overview
 Production-grade cryptocurrency alert API designed to showcase systems thinking for quantitative data engineering roles at top trading firms (Citadel, Jane Street, HRT, etc.).
 
-> Performance has not been benchmarked yet, so this document makes no latency, throughput or uptime claims. Complexity figures (e.g. O(log n + k) matching) come from the data
-> structures used, not from measurement.
+> Performance numbers in this document are measured by replaying a recorded
+> hour of real Binance trades through the pipeline; method, caveats and raw
+> results are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Anything not
+> measured there is stated as a complexity or a design goal, not a number.
 
 ## System Architecture
 
@@ -67,8 +69,17 @@ Production-grade cryptocurrency alert API designed to showcase systems thinking 
 - Binance is live; a Coinbase adapter exists but is not wired up yet
 
 **Performance Considerations:**
-- Single connection per exchange per symbol pair
-- Multiplexing: N alerts → 1 WebSocket connection
+- One connection per exchange carries every subscribed symbol: N alerts → 1 WebSocket
+- Every raw message goes through one `_dispatch()`, shared by the live socket and
+  the replay feed (`src/feed/replay.py`), so recordings exercise the real parser
+- Trade IDs are checked per symbol for gaps, duplicates and reordering
+
+### 1b. Match workers
+- `MATCH_WORKERS` (default 8) workers with bounded queues; a symbol always maps to
+  the same worker, so its trades are matched in order
+- A full queue makes the feed reader wait (backpressure) instead of dropping trades.
+  The original task-per-trade design lost 43% of trades in a 10× replay of real
+  bursts, by exhausting the Redis pool
 
 ### 2. Alert Matching Engine
 **Purpose:** Efficiently match incoming price updates against active alerts
@@ -77,22 +88,28 @@ Production-grade cryptocurrency alert API designed to showcase systems thinking 
 **Algorithm:**
 ```python
 # For each price update:
-# 1. O(log n + k) ZRANGEBYSCORE on the symbol's sorted set
-# 2. O(1) Redis read for alert metadata
-# 3. O(k) webhook dispatch for k matched alerts
-# Total: O(log n + k) per price update
+# 1. One pipelined round trip: ZRANGEBYSCORE on the armed and re-arm sets
+#    for both conditions, O(log n + k)
+# 2. Only for the k alerts that fire: ZREM claim, HGETALL metadata,
+#    Postgres status update, enqueue webhook
+# Total: O(log n + k) per price update; one Redis round trip when nothing fires
 ```
 
 **Key Features:**
-- Price-above, price-below, price-change-percentage conditions
+- Price-above and price-below conditions
 - Time-based expiration
-- One-time vs recurring alerts
-- Rate limiting per user
+- One-time vs recurring alerts (re-arm with hysteresis)
 
-**Scalability:**
-- 1M alerts: ~100MB memory (100 bytes per alert)
-- 1K price updates/sec: ~10ms processing time
-- Horizontal scaling: Shard by symbol
+**Measured** (M2 laptop, local Redis/Postgres, 1,000 alerts, real hour replayed):
+- Match: p50 0.48 ms, p99 1.87 ms per trade
+- 3,665 trades/s sustained (51× the recorded hour's real rate)
+- 10,000 alerts instead of 1,000 (10× the firings): 37% less throughput; each
+  fired alert's Postgres write runs inside the match step
+- At real speed: trade received → webhook delivered p50 40 ms, p99 254 ms
+  (mostly queueing in BTC bursts)
+- Not measured: memory per alert, more than one process
+
+**Scaling direction:** shard by symbol (each symbol is already pinned to one worker)
 
 ### 3. Webhook Delivery System
 **Purpose:** Reliable delivery of alert notifications
@@ -152,21 +169,21 @@ Keys:
 ## Performance Optimizations
 
 ### 1. Latency
-- **In-memory matching:** Redis sorted sets for hot path
-- **Connection pooling:** Reuse HTTP/WS connections
-- **Async I/O:** Non-blocking operations throughout
-- **Local caching:** LRU cache for frequently accessed data
+- **One Redis round trip per quiet trade:** the four sorted-set lookups are pipelined
+  (match p50 1.30 → 0.48 ms when this was added)
+- **Connection pooling:** reused HTTP, Redis and Postgres connections
+- **Async I/O:** non-blocking throughout
+- **Every stage timed:** `/api/v1/metrics/pipeline` reports p50–p99.9 per stage
 
 ### 2. Throughput
-- **Batching:** Group webhook deliveries
-- **Multiplexing:** Share WebSocket connections
-- **Horizontal scaling:** Stateless API servers
-- **Efficient data structures:** sorted sets
+- **Bounded, ordered match workers** with backpressure instead of unbounded tasks
+- **Multiplexing:** one WebSocket per exchange for every symbol
+- **Sorted sets:** cost grows with alerts that fire, not alerts that exist
 
 ### 3. Reliability
 - **Health checks:** /health endpoint for load balancers
 - **Timeouts:** every health probe and webhook has one
-- **Graceful degradation:** Fallback to polling if WS fails
+- **Self-healing feed:** reconnect on every kind of close, with backoff
 - **Monitoring:** Prometheus metrics + alerting
 
 ## Monitoring & Observability
@@ -270,19 +287,19 @@ curl -X POST https://api.cryptoalert.dev/api/v1/alerts \
 2. **Integration Tests:** API endpoints + DB
 3. **Load Tests:** k6/Locust (1K req/s)
 4. **Chaos Testing:** Random connection drops
-5. **Benchmark Suite:** Latency/throughput metrics
+5. **Benchmark Suite:** replay a recorded hour through the pipeline (`make bench`)
 
 ## Success Metrics for Portfolio
 
-### Technical Metrics (goals, not yet measured)
-- [ ] Benchmark matching latency and throughput, and publish the method
-- [ ] Measure uptime once publicly hosted
+### Technical Metrics
+- [x] Benchmark matching latency and throughput, and publish the method ([BENCHMARKS.md](docs/BENCHMARKS.md))
+- [x] Measure feed completeness (trade-ID gaps): 100% over the recorded hour
+- [ ] Take the fired-alert Postgres write off the match path (the p99.9 tail)
 - [ ] Wire up a second exchange (Coinbase adapter exists)
 - [ ] Demonstrate more than one API instance
 
-### Product Metrics (goals)
-- [ ] Developers using the hosted API
-- [ ] GitHub stars, write-ups, use cases
+Not pursued: an always-on public deployment. The project is evaluated by
+reproducible replays rather than uptime.
 
 ### Code Quality (for interviews)
 - ✅ Clean architecture (SOLID principles)
@@ -299,12 +316,13 @@ curl -X POST https://api.cryptoalert.dev/api/v1/alerts \
 
 2. **Performance:**
    - "One WebSocket per exchange carries every symbol: N alerts → 1 connection"
-   - (Add measured latency/memory figures here once benchmarked)
+   - "Replaying a real hour: 3,665 trades/s, match p50 0.48 ms, zero trades lost"
+   - "Replay found the original design lost 43% of trades in bursts"
 
 3. **Reliability:**
    - "Implemented exponential backoff for webhook retries"
    - "Exchange reconnects with capped exponential backoff, resubscribing every symbol"
-   - "Zero-downtime deployment with health checks"
+   - "Backpressure instead of loss: a full match queue slows the reader"
 
 4. **Trade-offs:**
    - "Chose Redis over in-memory for persistence vs pure speed"
@@ -313,9 +331,10 @@ curl -X POST https://api.cryptoalert.dev/api/v1/alerts \
 
 ## Next Steps
 
-1. Build MVP (Week 1-2)
-2. Open source + docs (Week 3)
-3. Community building (Week 4-6)
-4. Iterate based on feedback
+Driven by the benchmark numbers (see [BENCHMARKS.md](docs/BENCHMARKS.md#next-steps-the-numbers-point-to)):
+
+1. Move the fired-alert Postgres update off the match path
+2. Lua match-and-claim for alerts that fire
+3. Burst conflation for one-shot alerts
 
 This architecture demonstrates production-grade systems thinking while remaining implementable and scalable.
