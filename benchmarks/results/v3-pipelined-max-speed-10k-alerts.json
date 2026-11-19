@@ -1,0 +1,181 @@
+{
+  "run_at": "2026-11-19T01:03:30+00:00",
+  "recording": {
+    "file": "benchmarks/data/binance-1h.jsonl.gz",
+    "header": {
+      "format": "crypto-alert-recording",
+      "version": 1,
+      "exchange": "binance",
+      "symbols": [
+        "BTCUSDT",
+        "ETHUSDT",
+        "SOLUSDT",
+        "XRPUSDT",
+        "DOGEUSDT"
+      ],
+      "ws_url": "wss://stream.binance.com:9443/ws",
+      "started_at": "2026-11-18T22:30:50.481536+00:00"
+    },
+    "recorded_seconds": 3600.0,
+    "messages": 256383,
+    "trades": 256382,
+    "recorded_trades_per_second": 71.2
+  },
+  "config": {
+    "speed": "max",
+    "alerts_requested": 10000,
+    "alerts_loaded": 10000,
+    "alerts_seeded": 10000,
+    "recurring_fraction": 0.5,
+    "seed": 42,
+    "webhook_workers": 10
+  },
+  "environment": {
+    "machine": "Apple M2 Pro (10 cores), Darwin 24.3.0",
+    "python": "3.10.0",
+    "git_commit": "a258c7c",
+    "git_dirty": false
+  },
+  "throughput": {
+    "replay_wall_seconds": 109.825,
+    "total_wall_seconds": 110.176,
+    "trades_per_second": 2327.0,
+    "speedup_vs_real_time": 32.7,
+    "max_replay_lag_ms": 0.0,
+    "peak_pending_matches": 2827,
+    "drain_timed_out": false
+  },
+  "alerts": {
+    "fired": 15838,
+    "webhooks_received": 15838
+  },
+  "latency_ms": {
+    "exchange_to_receive": {
+      "count": 256382,
+      "mean_ms": 66.568,
+      "p50_ms": 58.14,
+      "p90_ms": 106.276,
+      "p99_ms": 190.899,
+      "p99.9_ms": 310.011,
+      "max_ms": 1002.692
+    },
+    "receive_to_match_start": {
+      "count": 256382,
+      "mean_ms": 573.215,
+      "p50_ms": 522.399,
+      "p90_ms": 1275.827,
+      "p99_ms": 2580.828,
+      "p99.9_ms": 3092.859,
+      "max_ms": 3298.868
+    },
+    "match": {
+      "count": 256382,
+      "mean_ms": 1.121,
+      "p50_ms": 0.565,
+      "p90_ms": 1.398,
+      "p99_ms": 8.77,
+      "p99.9_ms": 77.634,
+      "max_ms": 352.343
+    },
+    "webhook_queue_wait": {
+      "count": 15838,
+      "mean_ms": 1.322,
+      "p50_ms": 0.459,
+      "p90_ms": 1.23,
+      "p99_ms": 16.123,
+      "p99.9_ms": 24.005,
+      "max_ms": 33.16
+    },
+    "webhook_http": {
+      "count": 15838,
+      "mean_ms": 2.483,
+      "p50_ms": 2.03,
+      "p90_ms": 4.461,
+      "p99_ms": 6.549,
+      "p99.9_ms": 18.071,
+      "max_ms": 30.938
+    },
+    "receive_to_delivered": {
+      "count": 15838,
+      "mean_ms": 834.573,
+      "p50_ms": 635.341,
+      "p90_ms": 1921.779,
+      "p99_ms": 2944.816,
+      "p99.9_ms": 3177.219,
+      "max_ms": 3204.736
+    },
+    "exchange_to_delivered": {
+      "count": 15838,
+      "mean_ms": 910.359,
+      "p50_ms": 698.736,
+      "p90_ms": 2024.868,
+      "p99_ms": 2997.225,
+      "p99.9_ms": 3222.309,
+      "max_ms": 3249.984
+    }
+  },
+  "completeness": {
+    "symbols": {
+      "binance:BTCUSDT": {
+        "received": 113762,
+        "expected": 113762,
+        "missing": 0,
+        "gap_events": 0,
+        "largest_gap": 0,
+        "duplicates": 0,
+        "out_of_order": 0,
+        "completeness_pct": 100.0
+      },
+      "binance:DOGEUSDT": {
+        "received": 13427,
+        "expected": 13427,
+        "missing": 0,
+        "gap_events": 0,
+        "largest_gap": 0,
+        "duplicates": 0,
+        "out_of_order": 0,
+        "completeness_pct": 100.0
+      },
+      "binance:ETHUSDT": {
+        "received": 86050,
+        "expected": 86050,
+        "missing": 0,
+        "gap_events": 0,
+        "largest_gap": 0,
+        "duplicates": 0,
+        "out_of_order": 0,
+        "completeness_pct": 100.0
+      },
+      "binance:SOLUSDT": {
+        "received": 23748,
+        "expected": 23748,
+        "missing": 0,
+        "gap_events": 0,
+        "largest_gap": 0,
+        "duplicates": 0,
+        "out_of_order": 0,
+        "completeness_pct": 100.0
+      },
+      "binance:XRPUSDT": {
+        "received": 19395,
+        "expected": 19395,
+        "missing": 0,
+        "gap_events": 0,
+        "largest_gap": 0,
+        "duplicates": 0,
+        "out_of_order": 0,
+        "completeness_pct": 100.0
+      }
+    },
+    "total": {
+      "received": 256382,
+      "expected": 256382,
+      "missing": 0,
+      "gap_events": 0,
+      "duplicates": 0,
+      "out_of_order": 0,
+      "completeness_pct": 100.0
+    }
+  },
+  "warnings_and_errors": {}
+}
